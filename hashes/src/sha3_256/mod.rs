@@ -242,3 +242,76 @@ impl crate::HashEngine for HashEngine {
         self.finalize()
     }
 }
+
+#[cfg(test)]
+#[cfg(feature = "alloc")]
+#[cfg(feature = "hex")]
+mod tests {
+    use alloc::string::ToString;
+
+    struct TestCase {
+        input: &'static [u8],
+        output: &'static str,
+    }
+
+    const TESTS: [TestCase; 7] = [
+        TestCase {
+            // One below the rate block size.
+            input: b"The quick brown fox jumped over the lazy dog. The quick brown fox jumped over the lazy dog. The quick brown fox jumped over the lazy do",
+            output: "943509b3daac78347687edb7c7c8d3684fd5721e55ee394abdb897dde661b048"
+        },
+        TestCase {
+            // Exactly the rate block size.
+            input: b"The quick brown fox jumped over the lazy dog. The quick brown fox jumped over the lazy dog. The quick brown fox jumped over the lazy dog",
+            output: "53b56e8953fb3183aa4886cd79cd8a06b47b9200bfbab4a1b76fd4695efe2885"
+        },
+        TestCase {
+            // One byte over the rate block size.
+            input: b"The quick brown fox jumped over the lazy dog. The quick brown fox jumped over the lazy dog. The quick brown fox jumped over the lazy dog.",
+            output: "a7d61692295cf5c9c4cd0c7e3359667239cc1990f0aa9564be33c7b371298adc"
+        },
+        TestCase {
+            input: &[],
+            output: "a7ffc6f8bf1ed76651c14756a061d662f580ff4de43b49fa82d80a4b80f8434a",
+        },
+        // The following are taken from the Cryptographic Algorithm Validation Program by NIST.
+        // ref: https://csrc.nist.gov/projects/cryptographic-algorithm-validation-program/secure-hashing
+        TestCase {
+            input: &[0x5c, 0x56, 0xa6, 0xb1, 0x8c, 0x39, 0xe6, 0x6e, 0x1b, 0x7a, 0x99, 0x3a],
+            output: "b697556cb30d6df448ee38b973cb6942559de4c2567b1556240188c55ec0841c",
+        },
+        TestCase {
+            input: &[0x5c, 0x58, 0x9f, 0xc5, 0x4f, 0xef, 0xc4, 0xd6,
+                     0xe2, 0x24, 0x9a, 0x36, 0x58, 0x3e, 0x19, 0x92,
+                     0xfc, 0x6b, 0x8a, 0x9c, 0x07, 0x0e, 0x8e, 0x00,
+                     0xc4, 0x5a, 0x63, 0x9a, 0xf2, 0x20, 0x63, 0xe6,
+                     0x6a, 0xe5, 0xcd, 0xb8, 0x02, 0x38, 0xc8, 0x2d,
+                     0xb0, 0x43, 0xa5, 0xe1, 0xf3, 0x9f, 0x65, 0x62,
+                     0x6e, 0x6d, 0x7b, 0xe5, 0xd6, 0xa2, 0xd3, 0x38,
+                     0x0f, 0xa2, 0x12, 0xf8, 0x92, 0x11, 0x20, 0x04,
+                     0x12, 0xe5, 0xe4, 0x31, 0x5f, 0xc0, 0x4e, 0x40
+            ],
+            output: "18deba74e9d93ae7df93c6c316ef201bf5e3a661e68868e14d4f56264f5d858c",
+        },
+        TestCase {
+            input: &[0xf6, 0x5c, 0x3a, 0xa1, 0xd9, 0x98, 0x1a, 0x84,
+                     0xe4, 0x9f, 0xc8, 0x6d, 0x93, 0x8f, 0x3f, 0x75,
+                     0x6f, 0x60, 0xe3, 0x85, 0x8d, 0x5e, 0x1f, 0x69,
+                     0x57, 0xdd, 0x4d, 0x26, 0x8e, 0x28, 0xd6, 0x8e,
+                     0x90, 0xba, 0x9a, 0x11, 0xd7, 0xb1, 0x92, 0xd6,
+                     0xc3, 0x7f, 0xb3, 0x0b
+            ],
+            output: "3acbebf8eda9d3c99a6b6b666366c391e8200d55fd33ad8680734def1dc7ae85",
+        }
+    ];
+
+    #[test]
+    fn test() {
+        for test in TESTS {
+            let mut sha3 = super::HashEngine::new();
+            sha3.input(test.input);
+            let hash = crate::HashEngine::finalize(sha3);
+            assert_eq!(hash.to_string(), test.output);
+        }
+    }
+}
