@@ -12,6 +12,7 @@ cargo-fuzz = true
 [dependencies]
 honggfuzz = { version = "0.5.58", default-features = false }
 bitcoin = { path = "../bitcoin", features = [ "serde", "arbitrary" ] }
+consensus_encoding = { path = "../consensus_encoding", package = "consensus-encoding", features = ["alloc"] }
 p2p = { path = "../p2p", package = "bitcoin-p2p-messages", features = ["arbitrary"] }
 arbitrary = { version = "1.4.1" }
 
@@ -72,6 +73,18 @@ path = "fuzz_targets/bitcoin/parse_outpoint.rs"
 [[bin]]
 name = "bitcoin_script_bytes_to_asm_fmt"
 path = "fuzz_targets/bitcoin/script_bytes_to_asm_fmt.rs"
+
+[[bin]]
+name = "consensus_encoding_array"
+path = "fuzz_targets/consensus_encoding/array.rs"
+
+[[bin]]
+name = "consensus_encoding_compact_size"
+path = "fuzz_targets/consensus_encoding/compact_size.rs"
+
+[[bin]]
+name = "consensus_encoding_vector"
+path = "fuzz_targets/consensus_encoding/vector.rs"
 
 [[bin]]
 name = "hashes_json"
