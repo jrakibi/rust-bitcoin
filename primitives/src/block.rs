@@ -1162,7 +1162,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // bad test; will be fixed in next commit
     #[cfg(feature = "alloc")]
     fn block_decode() {
         // Make a simple block, encode then decode. Verify equivalence.
@@ -1192,7 +1191,10 @@ mod tests {
             version: crate::transaction::Version::ONE,
             lock_time: units::absolute::LockTime::from_height(block).unwrap(),
             inputs: vec![crate::transaction::TxIn::EMPTY_COINBASE],
-            outputs: Vec::new(),
+            outputs: vec![crate::transaction::TxOut {
+                amount: units::Amount::ONE_SAT,
+                script_pubkey: crate::script::ScriptPubKeyBuf::new(),
+            }],
         }];
         let original_block = Block::new_unchecked(header, transactions);
 
