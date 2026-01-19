@@ -120,10 +120,10 @@ impl MerkleNode for TxMerkleNode {
     fn from_leaf(leaf: Self::Leaf) -> Self { Self::from_byte_array(leaf.to_byte_array()) }
 
     fn combine(&self, other: &Self) -> Self {
-        let mut encoder = sha256d::Hash::engine();
-        encoder.input(self.as_byte_array());
-        encoder.input(other.as_byte_array());
-        Self::from_byte_array(sha256d::Hash::from_engine(encoder).to_byte_array())
+        let mut data = [0u8; 64];
+        data[..32].copy_from_slice(self.as_byte_array());
+        data[32..].copy_from_slice(other.as_byte_array());
+        Self::from_byte_array(sha256d::hash_64(&data))
     }
 }
 impl MerkleNode for WitnessMerkleNode {
@@ -131,10 +131,10 @@ impl MerkleNode for WitnessMerkleNode {
     fn from_leaf(leaf: Self::Leaf) -> Self { Self::from_byte_array(leaf.to_byte_array()) }
 
     fn combine(&self, other: &Self) -> Self {
-        let mut encoder = sha256d::Hash::engine();
-        encoder.input(self.as_byte_array());
-        encoder.input(other.as_byte_array());
-        Self::from_byte_array(sha256d::Hash::from_engine(encoder).to_byte_array())
+        let mut data = [0u8; 64];
+        data[..32].copy_from_slice(self.as_byte_array());
+        data[32..].copy_from_slice(other.as_byte_array());
+        Self::from_byte_array(sha256d::hash_64(&data))
     }
 }
 
