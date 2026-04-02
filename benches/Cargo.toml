@@ -37,6 +37,11 @@ name = "duplicate_inputs"
 path = "bitcoin/duplicate_inputs.rs"
 harness = false
 
+[[bench]]
+name = "merkle_tree"
+path = "bitcoin/merkle_tree.rs"
+harness = false
+
 
 [[bench]]
 name = "chacha20poly1305"
