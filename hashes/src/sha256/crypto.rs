@@ -340,9 +340,57 @@ impl HashEngine {
         let mut i = 0;
         let count = inputs.len();
 
-        // TODO: 8-way AVX2
-        // TODO: 4-way SSE4.1
-        // TODO: 2-way x86 SHA-NI
+        // x86_64 dispatch: SHA-NI > AVX2 > SSE4.1
+        // When SHA-NI is available, use 2-way hardware SHA (faster per-block than
+        // software 4/8-way). Otherwise fall through to AVX2 8-way, then SSE4.1 4-way.
+        #[cfg(all(feature = "std", target_arch = "x86_64"))]
+        {
+            let has_sha_ni = std::is_x86_feature_detected!("sha")
+                && std::is_x86_feature_detected!("sse4.1")
+                && std::is_x86_feature_detected!("sse2")
+                && std::is_x86_feature_detected!("ssse3");
+
+            if has_sha_ni {
+                while count - i >= 2 {
+                    let out = <&mut [[u8; 32]; 2]>::try_from(&mut outputs[i..i + 2]).unwrap();
+                    let inp = <&[[u8; 64]; 2]>::try_from(&inputs[i..i + 2]).unwrap();
+                    unsafe { Self::sha256d_64_x86_shani_2way(out, inp) };
+                    i += 2;
+                }
+            } else {
+                if std::is_x86_feature_detected!("avx2") {
+                    while count - i >= 8 {
+                        let out =
+                            <&mut [[u8; 32]; 8]>::try_from(&mut outputs[i..i + 8]).unwrap();
+                        let inp = <&[[u8; 64]; 8]>::try_from(&inputs[i..i + 8]).unwrap();
+                        unsafe { Self::sha256d_64_avx2_8way(out, inp) };
+                        i += 8;
+                    }
+                }
+                if std::is_x86_feature_detected!("sse4.1") {
+                    while count - i >= 4 {
+                        let out =
+                            <&mut [[u8; 32]; 4]>::try_from(&mut outputs[i..i + 4]).unwrap();
+                        let inp = <&[[u8; 64]; 4]>::try_from(&inputs[i..i + 4]).unwrap();
+                        unsafe { Self::sha256d_64_sse41_4way(out, inp) };
+                        i += 4;
+                    }
+                }
+            }
+        }
+
+        #[cfg(all(feature = "cpufeatures", target_arch = "x86_64"))]
+        {
+            if cpuid_sha256_x86::get() {
+                while count - i >= 2 {
+                    let out = <&mut [[u8; 32]; 2]>::try_from(&mut outputs[i..i + 2]).unwrap();
+                    let inp = <&[[u8; 64]; 2]>::try_from(&inputs[i..i + 2]).unwrap();
+                    unsafe { Self::sha256d_64_x86_shani_2way(out, inp) };
+                    i += 2;
+                }
+            }
+            // TODO: cpufeatures dispatch for AVX2/SSE4.1
+        }
 
         // 2-way ARM SHA2
         #[cfg(all(feature = "std", target_arch = "aarch64"))]
@@ -824,6 +872,1511 @@ impl HashEngine {
         // Save state
         vst1q_u32(state.as_mut_ptr().add(0), state0);
         vst1q_u32(state.as_mut_ptr().add(4), state1);
+    }
+
+    /// Computes SHA256d on two 64-byte inputs in parallel using x86 SHA-NI intrinsics.
+    ///
+    /// Based on Bitcoin Core's `sha256d64_x86_shani::Transform_2way`.
+    // https://github.com/bitcoin/bitcoin/blob/master/src/crypto/sha256_x86_shani.cpp
+    #[cfg(all(target_arch = "x86_64", any(feature = "std", feature = "cpufeatures")))]
+    #[target_feature(enable = "sha,sse2,ssse3,sse4.1")]
+    unsafe fn sha256d_64_x86_shani_2way(output: &mut [[u8; 32]; 2], input: &[[u8; 64]; 2]) {
+        use core::arch::x86_64::*;
+
+        #[allow(non_snake_case)]
+        let MASK: __m128i =
+            _mm_set_epi64x(0x0c0d_0e0f_0809_0a0bu64 as i64, 0x0405_0607_0001_0203u64 as i64);
+
+        // Initial state in shuffled (ABEF/CDGH) form.
+        #[allow(non_snake_case)]
+        let INIT0: __m128i =
+            _mm_set_epi64x(0x6a09e667bb67ae85u64 as i64, 0x510e527f9b05688cu64 as i64);
+        #[allow(non_snake_case)]
+        let INIT1: __m128i =
+            _mm_set_epi64x(0x3c6ef372a54ff53au64 as i64, 0x1f83d9ab5be0cd19u64 as i64);
+
+        // Precomputed W[i] + K[i] for the 2nd transform (padding block).
+        #[rustfmt::skip]
+        const MIDS: [[u64; 2]; 16] = [
+            [0x71374491c28a2f98, 0xe9b5dba5b5c0fbcf],
+            [0x59f111f13956c25b, 0xab1c5ed5923f82a4],
+            [0x12835b01d807aa98, 0x550c7dc3243185be],
+            [0x80deb1fe72be5d74, 0xc19bf3749bdc06a7],
+            [0xf0fe4786649b69c1, 0x240cf2540fe1edc6],
+            [0x6cc984be4fe9346f, 0x16f988fa61b9411e],
+            [0xa88e5a6df2c65152, 0xb9d99ec7b019fc65],
+            [0xe70eeaa09a1231c3, 0xc7353eb0fdb1232b],
+            [0xcb976d5f3069bad5, 0xdc1eeefd5a0f118f],
+            [0xde0b7a040a35b689, 0xe15d5b1658f4ca9d],
+            [0x37088980007f3e86, 0x6fab9537a507ea32],
+            [0x0d8cd6f117406110, 0xc0bbbe37cdaa3b6d],
+            [0xdb48a36383613bda, 0x6fd15ca70b02e931],
+            [0x31338431521afaca, 0x6d4378906ed41a95],
+            [0x9eccabbdc39c91f2, 0x532fb63cb5c9a0e6],
+            [0x07237ea3d2c741c6, 0x4c191d76a4954b68],
+        ];
+
+        // ---- Helper closures ----
+
+        // QuadRound with just constants (no message): 4 SHA256 rounds using
+        // precomputed W+K values packed as two u64.
+        #[inline(always)]
+        unsafe fn quad_round_k(
+            s0: &mut __m128i, s1: &mut __m128i, k1: u64, k0: u64,
+        ) {
+            let msg = _mm_set_epi64x(k1 as i64, k0 as i64);
+            *s1 = _mm_sha256rnds2_epu32(*s1, *s0, msg);
+            *s0 = _mm_sha256rnds2_epu32(*s0, *s1, _mm_shuffle_epi32(msg, 0x0E));
+        }
+
+        // QuadRound with message + round constants.
+        #[inline(always)]
+        unsafe fn quad_round(
+            s0: &mut __m128i, s1: &mut __m128i, m: __m128i, k1: u64, k0: u64,
+        ) {
+            let msg = _mm_add_epi32(m, _mm_set_epi64x(k1 as i64, k0 as i64));
+            *s1 = _mm_sha256rnds2_epu32(*s1, *s0, msg);
+            *s0 = _mm_sha256rnds2_epu32(*s0, *s1, _mm_shuffle_epi32(msg, 0x0E));
+        }
+
+        #[inline(always)]
+        unsafe fn shift_message_a(m0: &mut __m128i, m1: __m128i) {
+            *m0 = _mm_sha256msg1_epu32(*m0, m1);
+        }
+
+        #[inline(always)]
+        unsafe fn shift_message_c(m0: __m128i, m1: __m128i, m2: &mut __m128i) {
+            *m2 = _mm_sha256msg2_epu32(
+                _mm_add_epi32(*m2, _mm_alignr_epi8(m1, m0, 4)),
+                m1,
+            );
+        }
+
+        #[inline(always)]
+        unsafe fn shift_message_b(m0: &mut __m128i, m1: __m128i, m2: &mut __m128i) {
+            shift_message_c(*m0, m1, m2);
+            shift_message_a(m0, m1);
+        }
+
+        #[inline(always)]
+        unsafe fn unshuffle(s0: &mut __m128i, s1: &mut __m128i) {
+            let t1 = _mm_shuffle_epi32(*s0, 0x1B);
+            let t2 = _mm_shuffle_epi32(*s1, 0xB1);
+            *s0 = _mm_blend_epi16(t1, t2, 0xF0);
+            *s1 = _mm_alignr_epi8(t2, t1, 0x08);
+        }
+
+        #[inline(always)]
+        unsafe fn load(input: *const u8, mask: __m128i) -> __m128i {
+            _mm_shuffle_epi8(_mm_loadu_si128(input as *const __m128i), mask)
+        }
+
+        #[inline(always)]
+        unsafe fn save(out: *mut u8, s: __m128i, mask: __m128i) {
+            _mm_storeu_si128(out as *mut __m128i, _mm_shuffle_epi8(s, mask));
+        }
+
+        // ---- Begin 2-way Transform ----
+
+        // Load and byte-swap input messages for both lanes.
+        let mut am0 = load(input[0].as_ptr(), MASK);
+        let mut am1 = load(input[0].as_ptr().add(16), MASK);
+        let mut am2 = load(input[0].as_ptr().add(32), MASK);
+        let mut am3 = load(input[0].as_ptr().add(48), MASK);
+        let mut bm0 = load(input[1].as_ptr(), MASK);
+        let mut bm1 = load(input[1].as_ptr().add(16), MASK);
+        let mut bm2 = load(input[1].as_ptr().add(32), MASK);
+        let mut bm3 = load(input[1].as_ptr().add(48), MASK);
+
+        // Initialize state (already in shuffled ABEF/CDGH form).
+        let mut as0 = INIT0;
+        let mut as1 = INIT1;
+        let mut bs0 = INIT0;
+        let mut bs1 = INIT1;
+
+        // ---- Transform 1: SHA256 of 64-byte input block ----
+
+        // Rounds 0-3
+        quad_round(&mut as0, &mut as1, am0, 0xe9b5dba5b5c0fbcf, 0x71374491428a2f98);
+        quad_round(&mut bs0, &mut bs1, bm0, 0xe9b5dba5b5c0fbcf, 0x71374491428a2f98);
+        // Rounds 4-7
+        quad_round(&mut as0, &mut as1, am1, 0xab1c5ed5923f82a4, 0x59f111f13956c25b);
+        quad_round(&mut bs0, &mut bs1, bm1, 0xab1c5ed5923f82a4, 0x59f111f13956c25b);
+        // Rounds 8-11
+        shift_message_a(&mut am0, am1);
+        quad_round(&mut as0, &mut as1, am2, 0x550c7dc3243185be, 0x12835b01d807aa98);
+        quad_round(&mut bs0, &mut bs1, bm2, 0x550c7dc3243185be, 0x12835b01d807aa98);
+        shift_message_a(&mut bm0, bm1);
+        // Rounds 12-15
+        shift_message_b(&mut am1, am2, &mut am0);
+        quad_round(&mut as0, &mut as1, am3, 0xc19bf1749bdc06a7, 0x80deb1fe72be5d74);
+        quad_round(&mut bs0, &mut bs1, bm3, 0xc19bf1749bdc06a7, 0x80deb1fe72be5d74);
+        shift_message_b(&mut bm1, bm2, &mut bm0);
+        // Rounds 16-19
+        shift_message_b(&mut am2, am3, &mut am1);
+        quad_round(&mut as0, &mut as1, am0, 0x240ca1cc0fc19dc6, 0xefbe4786e49b69c1);
+        quad_round(&mut bs0, &mut bs1, bm0, 0x240ca1cc0fc19dc6, 0xefbe4786e49b69c1);
+        shift_message_b(&mut bm2, bm3, &mut bm1);
+        // Rounds 20-23
+        shift_message_b(&mut am3, am0, &mut am2);
+        quad_round(&mut as0, &mut as1, am1, 0x76f988da5cb0a9dc, 0x4a7484aa2de92c6f);
+        quad_round(&mut bs0, &mut bs1, bm1, 0x76f988da5cb0a9dc, 0x4a7484aa2de92c6f);
+        shift_message_b(&mut bm3, bm0, &mut bm2);
+        // Rounds 24-27
+        shift_message_b(&mut am0, am1, &mut am3);
+        quad_round(&mut as0, &mut as1, am2, 0xbf597fc7b00327c8, 0xa831c66d983e5152);
+        quad_round(&mut bs0, &mut bs1, bm2, 0xbf597fc7b00327c8, 0xa831c66d983e5152);
+        shift_message_b(&mut bm0, bm1, &mut bm3);
+        // Rounds 28-31
+        shift_message_b(&mut am1, am2, &mut am0);
+        quad_round(&mut as0, &mut as1, am3, 0x1429296706ca6351, 0xd5a79147c6e00bf3);
+        quad_round(&mut bs0, &mut bs1, bm3, 0x1429296706ca6351, 0xd5a79147c6e00bf3);
+        shift_message_b(&mut bm1, bm2, &mut bm0);
+        // Rounds 32-35
+        shift_message_b(&mut am2, am3, &mut am1);
+        quad_round(&mut as0, &mut as1, am0, 0x53380d134d2c6dfc, 0x2e1b213827b70a85);
+        quad_round(&mut bs0, &mut bs1, bm0, 0x53380d134d2c6dfc, 0x2e1b213827b70a85);
+        shift_message_b(&mut bm2, bm3, &mut bm1);
+        // Rounds 36-39
+        shift_message_b(&mut am3, am0, &mut am2);
+        quad_round(&mut as0, &mut as1, am1, 0x92722c8581c2c92e, 0x766a0abb650a7354);
+        quad_round(&mut bs0, &mut bs1, bm1, 0x92722c8581c2c92e, 0x766a0abb650a7354);
+        shift_message_b(&mut bm3, bm0, &mut bm2);
+        // Rounds 40-43
+        shift_message_b(&mut am0, am1, &mut am3);
+        quad_round(&mut as0, &mut as1, am2, 0xc76c51a3c24b8b70, 0xa81a664ba2bfe8a1);
+        quad_round(&mut bs0, &mut bs1, bm2, 0xc76c51a3c24b8b70, 0xa81a664ba2bfe8a1);
+        shift_message_b(&mut bm0, bm1, &mut bm3);
+        // Rounds 44-47
+        shift_message_b(&mut am1, am2, &mut am0);
+        quad_round(&mut as0, &mut as1, am3, 0x106aa070f40e3585, 0xd6990624d192e819);
+        quad_round(&mut bs0, &mut bs1, bm3, 0x106aa070f40e3585, 0xd6990624d192e819);
+        shift_message_b(&mut bm1, bm2, &mut bm0);
+        // Rounds 48-51
+        shift_message_b(&mut am2, am3, &mut am1);
+        quad_round(&mut as0, &mut as1, am0, 0x34b0bcb52748774c, 0x1e376c0819a4c116);
+        quad_round(&mut bs0, &mut bs1, bm0, 0x34b0bcb52748774c, 0x1e376c0819a4c116);
+        shift_message_b(&mut bm2, bm3, &mut bm1);
+        // Rounds 52-55
+        shift_message_c(am0, am1, &mut am2);
+        quad_round(&mut as0, &mut as1, am1, 0x682e6ff35b9cca4f, 0x4ed8aa4a391c0cb3);
+        quad_round(&mut bs0, &mut bs1, bm1, 0x682e6ff35b9cca4f, 0x4ed8aa4a391c0cb3);
+        shift_message_c(bm0, bm1, &mut bm2);
+        // Rounds 56-59
+        shift_message_c(am1, am2, &mut am3);
+        quad_round(&mut as0, &mut as1, am2, 0x8cc7020884c87814, 0x78a5636f748f82ee);
+        quad_round(&mut bs0, &mut bs1, bm2, 0x8cc7020884c87814, 0x78a5636f748f82ee);
+        shift_message_c(bm1, bm2, &mut bm3);
+        // Rounds 60-63
+        quad_round(&mut as0, &mut as1, am3, 0xc67178f2bef9a3f7, 0xa4506ceb90befffa);
+        quad_round(&mut bs0, &mut bs1, bm3, 0xc67178f2bef9a3f7, 0xa4506ceb90befffa);
+
+        // Add initial state back.
+        as0 = _mm_add_epi32(as0, INIT0);
+        as1 = _mm_add_epi32(as1, INIT1);
+        bs0 = _mm_add_epi32(bs0, INIT0);
+        bs1 = _mm_add_epi32(bs1, INIT1);
+
+        // ---- Transform 2: SHA256 of result with padding ----
+        // The second block is the 256-bit hash + padding (precomputed as MIDS).
+
+        // Save state from Transform 1 as the starting state for Transform 2.
+        let as0_save = as0;
+        let as1_save = as1;
+        let bs0_save = bs0;
+        let bs1_save = bs1;
+
+        // All 16 rounds use precomputed MIDS (W+K values).
+        for r in 0..16 {
+            quad_round_k(
+                &mut as0, &mut as1, MIDS[r][1], MIDS[r][0],
+            );
+            quad_round_k(
+                &mut bs0, &mut bs1, MIDS[r][1], MIDS[r][0],
+            );
+        }
+
+        // Add saved state.
+        as0 = _mm_add_epi32(as0, as0_save);
+        as1 = _mm_add_epi32(as1, as1_save);
+        bs0 = _mm_add_epi32(bs0, bs0_save);
+        bs1 = _mm_add_epi32(bs1, bs1_save);
+
+        // ---- Transform 3: SHA256d final (double hash) ----
+        // The input to Transform 3 is the 256-bit state from Transform 2,
+        // unshuffled back to standard order, then treated as a 32-byte message
+        // with standard SHA256 padding appended.
+
+        // Unshuffle state back to standard ABCDEFGH order for use as message.
+        unshuffle(&mut as0, &mut as1);
+        unshuffle(&mut bs0, &mut bs1);
+
+        // Message words for Transform 3:
+        //   m0 = state[0..3] (ABCD)
+        //   m1 = state[4..7] (EFGH)
+        //   m2 = 0x80000000, 0, 0, 0  (padding start)
+        //   m3 = 0, 0, 0, 0x100       (length = 256 bits, big-endian)
+        am0 = as0;
+        am1 = as1;
+        am2 = _mm_set_epi64x(0x0, 0x80000000_00000000u64 as i64);
+        am3 = _mm_set_epi64x(0x10000000000, 0x0);
+        bm0 = bs0;
+        bm1 = bs1;
+        bm2 = am2;
+        bm3 = am3;
+
+        // Re-initialize state to SHA256 IV (in shuffled form).
+        as0 = INIT0;
+        as1 = INIT1;
+        bs0 = INIT0;
+        bs1 = INIT1;
+
+        // Rounds 0-3
+        quad_round(&mut as0, &mut as1, am0, 0xe9b5dba5b5c0fbcf, 0x71374491428a2f98);
+        quad_round(&mut bs0, &mut bs1, bm0, 0xe9b5dba5b5c0fbcf, 0x71374491428a2f98);
+        // Rounds 4-7
+        quad_round(&mut as0, &mut as1, am1, 0xab1c5ed5923f82a4, 0x59f111f13956c25b);
+        quad_round(&mut bs0, &mut bs1, bm1, 0xab1c5ed5923f82a4, 0x59f111f13956c25b);
+        // Rounds 8-11
+        shift_message_a(&mut am0, am1);
+        quad_round(&mut as0, &mut as1, am2, 0x550c7dc3243185be, 0x12835b01d807aa98);
+        quad_round(&mut bs0, &mut bs1, bm2, 0x550c7dc3243185be, 0x12835b01d807aa98);
+        shift_message_a(&mut bm0, bm1);
+        // Rounds 12-15
+        shift_message_b(&mut am1, am2, &mut am0);
+        quad_round(&mut as0, &mut as1, am3, 0xc19bf1749bdc06a7, 0x80deb1fe72be5d74);
+        quad_round(&mut bs0, &mut bs1, bm3, 0xc19bf1749bdc06a7, 0x80deb1fe72be5d74);
+        shift_message_b(&mut bm1, bm2, &mut bm0);
+        // Rounds 16-19
+        shift_message_b(&mut am2, am3, &mut am1);
+        quad_round(&mut as0, &mut as1, am0, 0x240ca1cc0fc19dc6, 0xefbe4786e49b69c1);
+        quad_round(&mut bs0, &mut bs1, bm0, 0x240ca1cc0fc19dc6, 0xefbe4786e49b69c1);
+        shift_message_b(&mut bm2, bm3, &mut bm1);
+        // Rounds 20-23
+        shift_message_b(&mut am3, am0, &mut am2);
+        quad_round(&mut as0, &mut as1, am1, 0x76f988da5cb0a9dc, 0x4a7484aa2de92c6f);
+        quad_round(&mut bs0, &mut bs1, bm1, 0x76f988da5cb0a9dc, 0x4a7484aa2de92c6f);
+        shift_message_b(&mut bm3, bm0, &mut bm2);
+        // Rounds 24-27
+        shift_message_b(&mut am0, am1, &mut am3);
+        quad_round(&mut as0, &mut as1, am2, 0xbf597fc7b00327c8, 0xa831c66d983e5152);
+        quad_round(&mut bs0, &mut bs1, bm2, 0xbf597fc7b00327c8, 0xa831c66d983e5152);
+        shift_message_b(&mut bm0, bm1, &mut bm3);
+        // Rounds 28-31
+        shift_message_b(&mut am1, am2, &mut am0);
+        quad_round(&mut as0, &mut as1, am3, 0x1429296706ca6351, 0xd5a79147c6e00bf3);
+        quad_round(&mut bs0, &mut bs1, bm3, 0x1429296706ca6351, 0xd5a79147c6e00bf3);
+        shift_message_b(&mut bm1, bm2, &mut bm0);
+        // Rounds 32-35
+        shift_message_b(&mut am2, am3, &mut am1);
+        quad_round(&mut as0, &mut as1, am0, 0x53380d134d2c6dfc, 0x2e1b213827b70a85);
+        quad_round(&mut bs0, &mut bs1, bm0, 0x53380d134d2c6dfc, 0x2e1b213827b70a85);
+        shift_message_b(&mut bm2, bm3, &mut bm1);
+        // Rounds 36-39
+        shift_message_b(&mut am3, am0, &mut am2);
+        quad_round(&mut as0, &mut as1, am1, 0x92722c8581c2c92e, 0x766a0abb650a7354);
+        quad_round(&mut bs0, &mut bs1, bm1, 0x92722c8581c2c92e, 0x766a0abb650a7354);
+        shift_message_b(&mut bm3, bm0, &mut bm2);
+        // Rounds 40-43
+        shift_message_b(&mut am0, am1, &mut am3);
+        quad_round(&mut as0, &mut as1, am2, 0xc76c51a3c24b8b70, 0xa81a664ba2bfe8a1);
+        quad_round(&mut bs0, &mut bs1, bm2, 0xc76c51a3c24b8b70, 0xa81a664ba2bfe8a1);
+        shift_message_b(&mut bm0, bm1, &mut bm3);
+        // Rounds 44-47
+        shift_message_b(&mut am1, am2, &mut am0);
+        quad_round(&mut as0, &mut as1, am3, 0x106aa070f40e3585, 0xd6990624d192e819);
+        quad_round(&mut bs0, &mut bs1, bm3, 0x106aa070f40e3585, 0xd6990624d192e819);
+        shift_message_b(&mut bm1, bm2, &mut bm0);
+        // Rounds 48-51
+        shift_message_b(&mut am2, am3, &mut am1);
+        quad_round(&mut as0, &mut as1, am0, 0x34b0bcb52748774c, 0x1e376c0819a4c116);
+        quad_round(&mut bs0, &mut bs1, bm0, 0x34b0bcb52748774c, 0x1e376c0819a4c116);
+        shift_message_b(&mut bm2, bm3, &mut bm1);
+        // Rounds 52-55
+        shift_message_c(am0, am1, &mut am2);
+        quad_round(&mut as0, &mut as1, am1, 0x682e6ff35b9cca4f, 0x4ed8aa4a391c0cb3);
+        quad_round(&mut bs0, &mut bs1, bm1, 0x682e6ff35b9cca4f, 0x4ed8aa4a391c0cb3);
+        shift_message_c(bm0, bm1, &mut bm2);
+        // Rounds 56-59
+        shift_message_c(am1, am2, &mut am3);
+        quad_round(&mut as0, &mut as1, am2, 0x8cc7020884c87814, 0x78a5636f748f82ee);
+        quad_round(&mut bs0, &mut bs1, bm2, 0x8cc7020884c87814, 0x78a5636f748f82ee);
+        shift_message_c(bm1, bm2, &mut bm3);
+        // Rounds 60-63
+        quad_round(&mut as0, &mut as1, am3, 0xc67178f2bef9a3f7, 0xa4506ceb90befffa);
+        quad_round(&mut bs0, &mut bs1, bm3, 0xc67178f2bef9a3f7, 0xa4506ceb90befffa);
+
+        // Add initial state back.
+        as0 = _mm_add_epi32(as0, INIT0);
+        as1 = _mm_add_epi32(as1, INIT1);
+        bs0 = _mm_add_epi32(bs0, INIT0);
+        bs1 = _mm_add_epi32(bs1, INIT1);
+
+        // Unshuffle to get standard ABCDEFGH order, then byte-swap and store.
+        unshuffle(&mut as0, &mut as1);
+        unshuffle(&mut bs0, &mut bs1);
+
+        save(output[0].as_mut_ptr(), as0, MASK);
+        save(output[0].as_mut_ptr().add(16), as1, MASK);
+        save(output[1].as_mut_ptr(), bs0, MASK);
+        save(output[1].as_mut_ptr().add(16), bs1, MASK);
+    }
+
+    /// Computes SHA256d on four 64-byte inputs in parallel using SSE4.1 intrinsics.
+    ///
+    /// Based on Bitcoin Core's `sha256d64_sse41::Transform_4way`.
+    // https://github.com/bitcoin/bitcoin/blob/master/src/crypto/sha256_sse41.cpp
+    #[cfg(all(target_arch = "x86_64", any(feature = "std", feature = "cpufeatures")))]
+    #[target_feature(enable = "sse4.1")]
+    unsafe fn sha256d_64_sse41_4way(output: &mut [[u8; 32]; 4], input: &[[u8; 64]; 4]) {
+        use core::arch::x86_64::*;
+
+        #[inline(always)]
+        unsafe fn k(x: u32) -> __m128i { _mm_set1_epi32(x as i32) }
+        #[inline(always)]
+        unsafe fn add2(a: __m128i, b: __m128i) -> __m128i { _mm_add_epi32(a, b) }
+        #[inline(always)]
+        unsafe fn add3(a: __m128i, b: __m128i, c: __m128i) -> __m128i { add2(add2(a, b), c) }
+        #[inline(always)]
+        unsafe fn add4(a: __m128i, b: __m128i, c: __m128i, d: __m128i) -> __m128i {
+            add2(add2(a, b), add2(c, d))
+        }
+        #[inline(always)]
+        unsafe fn add5(
+            a: __m128i,
+            b: __m128i,
+            c: __m128i,
+            d: __m128i,
+            e: __m128i,
+        ) -> __m128i {
+            add2(add3(a, b, c), add2(d, e))
+        }
+        #[inline(always)]
+        unsafe fn xor2(a: __m128i, b: __m128i) -> __m128i { _mm_xor_si128(a, b) }
+        #[inline(always)]
+        unsafe fn xor3(a: __m128i, b: __m128i, c: __m128i) -> __m128i { xor2(xor2(a, b), c) }
+        #[inline(always)]
+        unsafe fn or(a: __m128i, b: __m128i) -> __m128i { _mm_or_si128(a, b) }
+        #[inline(always)]
+        unsafe fn and(a: __m128i, b: __m128i) -> __m128i { _mm_and_si128(a, b) }
+
+        #[inline(always)]
+        unsafe fn ch(x: __m128i, y: __m128i, z: __m128i) -> __m128i {
+            xor2(z, and(x, xor2(y, z)))
+        }
+        #[inline(always)]
+        unsafe fn maj(x: __m128i, y: __m128i, z: __m128i) -> __m128i {
+            or(and(x, y), and(z, or(x, y)))
+        }
+        #[inline(always)]
+        unsafe fn big_sigma0(x: __m128i) -> __m128i {
+            xor3(
+                or(_mm_srli_epi32(x, 2), _mm_slli_epi32(x, 30)),
+                or(_mm_srli_epi32(x, 13), _mm_slli_epi32(x, 19)),
+                or(_mm_srli_epi32(x, 22), _mm_slli_epi32(x, 10)),
+            )
+        }
+        #[inline(always)]
+        unsafe fn big_sigma1(x: __m128i) -> __m128i {
+            xor3(
+                or(_mm_srli_epi32(x, 6), _mm_slli_epi32(x, 26)),
+                or(_mm_srli_epi32(x, 11), _mm_slli_epi32(x, 21)),
+                or(_mm_srli_epi32(x, 25), _mm_slli_epi32(x, 7)),
+            )
+        }
+        #[inline(always)]
+        unsafe fn small_sigma0(x: __m128i) -> __m128i {
+            xor3(
+                or(_mm_srli_epi32(x, 7), _mm_slli_epi32(x, 25)),
+                or(_mm_srli_epi32(x, 18), _mm_slli_epi32(x, 14)),
+                _mm_srli_epi32(x, 3),
+            )
+        }
+        #[inline(always)]
+        unsafe fn small_sigma1(x: __m128i) -> __m128i {
+            xor3(
+                or(_mm_srli_epi32(x, 17), _mm_slli_epi32(x, 15)),
+                or(_mm_srli_epi32(x, 19), _mm_slli_epi32(x, 13)),
+                _mm_srli_epi32(x, 10),
+            )
+        }
+
+        #[inline(always)]
+        unsafe fn round(
+            a: __m128i,
+            b: __m128i,
+            c: __m128i,
+            d: &mut __m128i,
+            e: __m128i,
+            f: __m128i,
+            g: __m128i,
+            h: &mut __m128i,
+            ki: __m128i,
+        ) {
+            let t1 = add4(*h, big_sigma1(e), ch(e, f, g), ki);
+            let t2 = add2(big_sigma0(a), maj(a, b, c));
+            *d = add2(*d, t1);
+            *h = add2(t1, t2);
+        }
+
+        #[inline(always)]
+        unsafe fn read4(base: *const u8, offset: usize, shuf: __m128i) -> __m128i {
+            let w0 = (base.add(offset) as *const u32).read_unaligned();
+            let w1 = (base.add(64 + offset) as *const u32).read_unaligned();
+            let w2 = (base.add(128 + offset) as *const u32).read_unaligned();
+            let w3 = (base.add(192 + offset) as *const u32).read_unaligned();
+            let ret = _mm_set_epi32(w0 as i32, w1 as i32, w2 as i32, w3 as i32);
+            _mm_shuffle_epi8(ret, shuf)
+        }
+
+        #[inline(always)]
+        unsafe fn write4(base: *mut u8, offset: usize, v: __m128i, shuf: __m128i) {
+            let v = _mm_shuffle_epi8(v, shuf);
+            (base.add(offset) as *mut u32)
+                .write_unaligned(_mm_extract_epi32::<3>(v) as u32);
+            (base.add(32 + offset) as *mut u32)
+                .write_unaligned(_mm_extract_epi32::<2>(v) as u32);
+            (base.add(64 + offset) as *mut u32)
+                .write_unaligned(_mm_extract_epi32::<1>(v) as u32);
+            (base.add(96 + offset) as *mut u32)
+                .write_unaligned(_mm_extract_epi32::<0>(v) as u32);
+        }
+
+        let shuf_mask = _mm_set_epi32(
+            0x0C0D0E0Fu32 as i32,
+            0x08090A0Bu32 as i32,
+            0x04050607u32 as i32,
+            0x00010203u32 as i32,
+        );
+
+        #[rustfmt::skip]
+        const K: [u32; 64] = [
+            0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+            0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+            0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+            0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+            0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+            0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+            0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+            0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
+        ];
+
+        #[rustfmt::skip]
+        const MIDS: [u32; 64] = [
+            0xc28a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+            0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf374,
+            0x649b69c1, 0xf0fe4786, 0x0fe1edc6, 0x240cf254, 0x4fe9346f, 0x6cc984be, 0x61b9411e, 0x16f988fa,
+            0xf2c65152, 0xa88e5a6d, 0xb019fc65, 0xb9d99ec7, 0x9a1231c3, 0xe70eeaa0, 0xfdb1232b, 0xc7353eb0,
+            0x3069bad5, 0xcb976d5f, 0x5a0f118f, 0xdc1eeefd, 0x0a35b689, 0xde0b7a04, 0x58f4ca9d, 0xe15d5b16,
+            0x007f3e86, 0x37088980, 0xa507ea32, 0x6fab9537, 0x17406110, 0x0d8cd6f1, 0xcdaa3b6d, 0xc0bbbe37,
+            0x83613bda, 0xdb48a363, 0x0b02e931, 0x6fd15ca7, 0x521afaca, 0x31338431, 0x6ed41a95, 0x6d437890,
+            0xc39c91f2, 0x9eccabbd, 0xb5c9a0e6, 0x532fb63c, 0xd2c741c6, 0x07237ea3, 0xa4954b68, 0x4c191d76,
+        ];
+
+        let inp = input.as_ptr() as *const u8;
+
+        // SHA-256 initial hash value
+        let iv0 = k(0x6a09e667);
+        let iv1 = k(0xbb67ae85);
+        let iv2 = k(0x3c6ef372);
+        let iv3 = k(0xa54ff53a);
+        let iv4 = k(0x510e527f);
+        let iv5 = k(0x9b05688c);
+        let iv6 = k(0x1f83d9ab);
+        let iv7 = k(0x5be0cd19);
+
+        // ---- Transform 1: SHA-256 of the 64-byte input blocks ----
+        let mut a = iv0;
+        let mut b = iv1;
+        let mut c = iv2;
+        let mut d = iv3;
+        let mut e = iv4;
+        let mut f = iv5;
+        let mut g = iv6;
+        let mut h = iv7;
+
+        // Load message words
+        let mut w0 = read4(inp, 4 * 0, shuf_mask);
+        let mut w1 = read4(inp, 4 * 1, shuf_mask);
+        let mut w2 = read4(inp, 4 * 2, shuf_mask);
+        let mut w3 = read4(inp, 4 * 3, shuf_mask);
+        let mut w4 = read4(inp, 4 * 4, shuf_mask);
+        let mut w5 = read4(inp, 4 * 5, shuf_mask);
+        let mut w6 = read4(inp, 4 * 6, shuf_mask);
+        let mut w7 = read4(inp, 4 * 7, shuf_mask);
+        let mut w8 = read4(inp, 4 * 8, shuf_mask);
+        let mut w9 = read4(inp, 4 * 9, shuf_mask);
+        let mut w10 = read4(inp, 4 * 10, shuf_mask);
+        let mut w11 = read4(inp, 4 * 11, shuf_mask);
+        let mut w12 = read4(inp, 4 * 12, shuf_mask);
+        let mut w13 = read4(inp, 4 * 13, shuf_mask);
+        let mut w14 = read4(inp, 4 * 14, shuf_mask);
+        let mut w15 = read4(inp, 4 * 15, shuf_mask);
+
+        // Rounds 0-15
+        round(a, b, c, &mut d, e, f, g, &mut h, add2(k(K[0]), w0));
+        round(h, a, b, &mut c, d, e, f, &mut g, add2(k(K[1]), w1));
+        round(g, h, a, &mut b, c, d, e, &mut f, add2(k(K[2]), w2));
+        round(f, g, h, &mut a, b, c, d, &mut e, add2(k(K[3]), w3));
+        round(e, f, g, &mut h, a, b, c, &mut d, add2(k(K[4]), w4));
+        round(d, e, f, &mut g, h, a, b, &mut c, add2(k(K[5]), w5));
+        round(c, d, e, &mut f, g, h, a, &mut b, add2(k(K[6]), w6));
+        round(b, c, d, &mut e, f, g, h, &mut a, add2(k(K[7]), w7));
+        round(a, b, c, &mut d, e, f, g, &mut h, add2(k(K[8]), w8));
+        round(h, a, b, &mut c, d, e, f, &mut g, add2(k(K[9]), w9));
+        round(g, h, a, &mut b, c, d, e, &mut f, add2(k(K[10]), w10));
+        round(f, g, h, &mut a, b, c, d, &mut e, add2(k(K[11]), w11));
+        round(e, f, g, &mut h, a, b, c, &mut d, add2(k(K[12]), w12));
+        round(d, e, f, &mut g, h, a, b, &mut c, add2(k(K[13]), w13));
+        round(c, d, e, &mut f, g, h, a, &mut b, add2(k(K[14]), w14));
+        round(b, c, d, &mut e, f, g, h, &mut a, add2(k(K[15]), w15));
+
+        // Rounds 16-63 with message schedule
+        w0 = add4(small_sigma1(w14), w9, small_sigma0(w1), w0);
+        round(a, b, c, &mut d, e, f, g, &mut h, add2(k(K[16]), w0));
+        w1 = add4(small_sigma1(w15), w10, small_sigma0(w2), w1);
+        round(h, a, b, &mut c, d, e, f, &mut g, add2(k(K[17]), w1));
+        w2 = add4(small_sigma1(w0), w11, small_sigma0(w3), w2);
+        round(g, h, a, &mut b, c, d, e, &mut f, add2(k(K[18]), w2));
+        w3 = add4(small_sigma1(w1), w12, small_sigma0(w4), w3);
+        round(f, g, h, &mut a, b, c, d, &mut e, add2(k(K[19]), w3));
+        w4 = add4(small_sigma1(w2), w13, small_sigma0(w5), w4);
+        round(e, f, g, &mut h, a, b, c, &mut d, add2(k(K[20]), w4));
+        w5 = add4(small_sigma1(w3), w14, small_sigma0(w6), w5);
+        round(d, e, f, &mut g, h, a, b, &mut c, add2(k(K[21]), w5));
+        w6 = add4(small_sigma1(w4), w15, small_sigma0(w7), w6);
+        round(c, d, e, &mut f, g, h, a, &mut b, add2(k(K[22]), w6));
+        w7 = add4(small_sigma1(w5), w0, small_sigma0(w8), w7);
+        round(b, c, d, &mut e, f, g, h, &mut a, add2(k(K[23]), w7));
+        w8 = add4(small_sigma1(w6), w1, small_sigma0(w9), w8);
+        round(a, b, c, &mut d, e, f, g, &mut h, add2(k(K[24]), w8));
+        w9 = add4(small_sigma1(w7), w2, small_sigma0(w10), w9);
+        round(h, a, b, &mut c, d, e, f, &mut g, add2(k(K[25]), w9));
+        w10 = add4(small_sigma1(w8), w3, small_sigma0(w11), w10);
+        round(g, h, a, &mut b, c, d, e, &mut f, add2(k(K[26]), w10));
+        w11 = add4(small_sigma1(w9), w4, small_sigma0(w12), w11);
+        round(f, g, h, &mut a, b, c, d, &mut e, add2(k(K[27]), w11));
+        w12 = add4(small_sigma1(w10), w5, small_sigma0(w13), w12);
+        round(e, f, g, &mut h, a, b, c, &mut d, add2(k(K[28]), w12));
+        w13 = add4(small_sigma1(w11), w6, small_sigma0(w14), w13);
+        round(d, e, f, &mut g, h, a, b, &mut c, add2(k(K[29]), w13));
+        w14 = add4(small_sigma1(w12), w7, small_sigma0(w15), w14);
+        round(c, d, e, &mut f, g, h, a, &mut b, add2(k(K[30]), w14));
+        w15 = add4(small_sigma1(w13), w8, small_sigma0(w0), w15);
+        round(b, c, d, &mut e, f, g, h, &mut a, add2(k(K[31]), w15));
+        w0 = add4(small_sigma1(w14), w9, small_sigma0(w1), w0);
+        round(a, b, c, &mut d, e, f, g, &mut h, add2(k(K[32]), w0));
+        w1 = add4(small_sigma1(w15), w10, small_sigma0(w2), w1);
+        round(h, a, b, &mut c, d, e, f, &mut g, add2(k(K[33]), w1));
+        w2 = add4(small_sigma1(w0), w11, small_sigma0(w3), w2);
+        round(g, h, a, &mut b, c, d, e, &mut f, add2(k(K[34]), w2));
+        w3 = add4(small_sigma1(w1), w12, small_sigma0(w4), w3);
+        round(f, g, h, &mut a, b, c, d, &mut e, add2(k(K[35]), w3));
+        w4 = add4(small_sigma1(w2), w13, small_sigma0(w5), w4);
+        round(e, f, g, &mut h, a, b, c, &mut d, add2(k(K[36]), w4));
+        w5 = add4(small_sigma1(w3), w14, small_sigma0(w6), w5);
+        round(d, e, f, &mut g, h, a, b, &mut c, add2(k(K[37]), w5));
+        w6 = add4(small_sigma1(w4), w15, small_sigma0(w7), w6);
+        round(c, d, e, &mut f, g, h, a, &mut b, add2(k(K[38]), w6));
+        w7 = add4(small_sigma1(w5), w0, small_sigma0(w8), w7);
+        round(b, c, d, &mut e, f, g, h, &mut a, add2(k(K[39]), w7));
+        w8 = add4(small_sigma1(w6), w1, small_sigma0(w9), w8);
+        round(a, b, c, &mut d, e, f, g, &mut h, add2(k(K[40]), w8));
+        w9 = add4(small_sigma1(w7), w2, small_sigma0(w10), w9);
+        round(h, a, b, &mut c, d, e, f, &mut g, add2(k(K[41]), w9));
+        w10 = add4(small_sigma1(w8), w3, small_sigma0(w11), w10);
+        round(g, h, a, &mut b, c, d, e, &mut f, add2(k(K[42]), w10));
+        w11 = add4(small_sigma1(w9), w4, small_sigma0(w12), w11);
+        round(f, g, h, &mut a, b, c, d, &mut e, add2(k(K[43]), w11));
+        w12 = add4(small_sigma1(w10), w5, small_sigma0(w13), w12);
+        round(e, f, g, &mut h, a, b, c, &mut d, add2(k(K[44]), w12));
+        w13 = add4(small_sigma1(w11), w6, small_sigma0(w14), w13);
+        round(d, e, f, &mut g, h, a, b, &mut c, add2(k(K[45]), w13));
+        w14 = add4(small_sigma1(w12), w7, small_sigma0(w15), w14);
+        round(c, d, e, &mut f, g, h, a, &mut b, add2(k(K[46]), w14));
+        w15 = add4(small_sigma1(w13), w8, small_sigma0(w0), w15);
+        round(b, c, d, &mut e, f, g, h, &mut a, add2(k(K[47]), w15));
+        w0 = add4(small_sigma1(w14), w9, small_sigma0(w1), w0);
+        round(a, b, c, &mut d, e, f, g, &mut h, add2(k(K[48]), w0));
+        w1 = add4(small_sigma1(w15), w10, small_sigma0(w2), w1);
+        round(h, a, b, &mut c, d, e, f, &mut g, add2(k(K[49]), w1));
+        w2 = add4(small_sigma1(w0), w11, small_sigma0(w3), w2);
+        round(g, h, a, &mut b, c, d, e, &mut f, add2(k(K[50]), w2));
+        w3 = add4(small_sigma1(w1), w12, small_sigma0(w4), w3);
+        round(f, g, h, &mut a, b, c, d, &mut e, add2(k(K[51]), w3));
+        w4 = add4(small_sigma1(w2), w13, small_sigma0(w5), w4);
+        round(e, f, g, &mut h, a, b, c, &mut d, add2(k(K[52]), w4));
+        w5 = add4(small_sigma1(w3), w14, small_sigma0(w6), w5);
+        round(d, e, f, &mut g, h, a, b, &mut c, add2(k(K[53]), w5));
+        w6 = add4(small_sigma1(w4), w15, small_sigma0(w7), w6);
+        round(c, d, e, &mut f, g, h, a, &mut b, add2(k(K[54]), w6));
+        w7 = add4(small_sigma1(w5), w0, small_sigma0(w8), w7);
+        round(b, c, d, &mut e, f, g, h, &mut a, add2(k(K[55]), w7));
+        w8 = add4(small_sigma1(w6), w1, small_sigma0(w9), w8);
+        round(a, b, c, &mut d, e, f, g, &mut h, add2(k(K[56]), w8));
+        w9 = add4(small_sigma1(w7), w2, small_sigma0(w10), w9);
+        round(h, a, b, &mut c, d, e, f, &mut g, add2(k(K[57]), w9));
+        w10 = add4(small_sigma1(w8), w3, small_sigma0(w11), w10);
+        round(g, h, a, &mut b, c, d, e, &mut f, add2(k(K[58]), w10));
+        w11 = add4(small_sigma1(w9), w4, small_sigma0(w12), w11);
+        round(f, g, h, &mut a, b, c, d, &mut e, add2(k(K[59]), w11));
+        w12 = add4(small_sigma1(w10), w5, small_sigma0(w13), w12);
+        round(e, f, g, &mut h, a, b, c, &mut d, add2(k(K[60]), w12));
+        w13 = add4(small_sigma1(w11), w6, small_sigma0(w14), w13);
+        round(d, e, f, &mut g, h, a, b, &mut c, add2(k(K[61]), w13));
+        w14 = add4(small_sigma1(w12), w7, small_sigma0(w15), w14);
+        round(c, d, e, &mut f, g, h, a, &mut b, add2(k(K[62]), w14));
+        w15 = add4(small_sigma1(w13), w8, small_sigma0(w0), w15);
+        round(b, c, d, &mut e, f, g, h, &mut a, add2(k(K[63]), w15));
+
+        // Add IV back
+        a = add2(a, iv0);
+        b = add2(b, iv1);
+        c = add2(c, iv2);
+        d = add2(d, iv3);
+        e = add2(e, iv4);
+        f = add2(f, iv5);
+        g = add2(g, iv6);
+        h = add2(h, iv7);
+
+        // Save Transform 1 output
+        let t0 = a;
+        let t1 = b;
+        let t2 = c;
+        let t3 = d;
+        let t4 = e;
+        let t5 = f;
+        let t6 = g;
+        let t7 = h;
+
+        // ---- Transform 2: SHA-256 of midstate padding ----
+        // State carries over from Transform 1 (NOT reset to IV).
+        // MIDS = precomputed K + W for the padding block after a 64-byte input.
+
+        // All 64 rounds with MIDS constants (precomputed K + padding)
+        round(a, b, c, &mut d, e, f, g, &mut h, k(MIDS[0]));
+        round(h, a, b, &mut c, d, e, f, &mut g, k(MIDS[1]));
+        round(g, h, a, &mut b, c, d, e, &mut f, k(MIDS[2]));
+        round(f, g, h, &mut a, b, c, d, &mut e, k(MIDS[3]));
+        round(e, f, g, &mut h, a, b, c, &mut d, k(MIDS[4]));
+        round(d, e, f, &mut g, h, a, b, &mut c, k(MIDS[5]));
+        round(c, d, e, &mut f, g, h, a, &mut b, k(MIDS[6]));
+        round(b, c, d, &mut e, f, g, h, &mut a, k(MIDS[7]));
+        round(a, b, c, &mut d, e, f, g, &mut h, k(MIDS[8]));
+        round(h, a, b, &mut c, d, e, f, &mut g, k(MIDS[9]));
+        round(g, h, a, &mut b, c, d, e, &mut f, k(MIDS[10]));
+        round(f, g, h, &mut a, b, c, d, &mut e, k(MIDS[11]));
+        round(e, f, g, &mut h, a, b, c, &mut d, k(MIDS[12]));
+        round(d, e, f, &mut g, h, a, b, &mut c, k(MIDS[13]));
+        round(c, d, e, &mut f, g, h, a, &mut b, k(MIDS[14]));
+        round(b, c, d, &mut e, f, g, h, &mut a, k(MIDS[15]));
+        round(a, b, c, &mut d, e, f, g, &mut h, k(MIDS[16]));
+        round(h, a, b, &mut c, d, e, f, &mut g, k(MIDS[17]));
+        round(g, h, a, &mut b, c, d, e, &mut f, k(MIDS[18]));
+        round(f, g, h, &mut a, b, c, d, &mut e, k(MIDS[19]));
+        round(e, f, g, &mut h, a, b, c, &mut d, k(MIDS[20]));
+        round(d, e, f, &mut g, h, a, b, &mut c, k(MIDS[21]));
+        round(c, d, e, &mut f, g, h, a, &mut b, k(MIDS[22]));
+        round(b, c, d, &mut e, f, g, h, &mut a, k(MIDS[23]));
+        round(a, b, c, &mut d, e, f, g, &mut h, k(MIDS[24]));
+        round(h, a, b, &mut c, d, e, f, &mut g, k(MIDS[25]));
+        round(g, h, a, &mut b, c, d, e, &mut f, k(MIDS[26]));
+        round(f, g, h, &mut a, b, c, d, &mut e, k(MIDS[27]));
+        round(e, f, g, &mut h, a, b, c, &mut d, k(MIDS[28]));
+        round(d, e, f, &mut g, h, a, b, &mut c, k(MIDS[29]));
+        round(c, d, e, &mut f, g, h, a, &mut b, k(MIDS[30]));
+        round(b, c, d, &mut e, f, g, h, &mut a, k(MIDS[31]));
+        round(a, b, c, &mut d, e, f, g, &mut h, k(MIDS[32]));
+        round(h, a, b, &mut c, d, e, f, &mut g, k(MIDS[33]));
+        round(g, h, a, &mut b, c, d, e, &mut f, k(MIDS[34]));
+        round(f, g, h, &mut a, b, c, d, &mut e, k(MIDS[35]));
+        round(e, f, g, &mut h, a, b, c, &mut d, k(MIDS[36]));
+        round(d, e, f, &mut g, h, a, b, &mut c, k(MIDS[37]));
+        round(c, d, e, &mut f, g, h, a, &mut b, k(MIDS[38]));
+        round(b, c, d, &mut e, f, g, h, &mut a, k(MIDS[39]));
+        round(a, b, c, &mut d, e, f, g, &mut h, k(MIDS[40]));
+        round(h, a, b, &mut c, d, e, f, &mut g, k(MIDS[41]));
+        round(g, h, a, &mut b, c, d, e, &mut f, k(MIDS[42]));
+        round(f, g, h, &mut a, b, c, d, &mut e, k(MIDS[43]));
+        round(e, f, g, &mut h, a, b, c, &mut d, k(MIDS[44]));
+        round(d, e, f, &mut g, h, a, b, &mut c, k(MIDS[45]));
+        round(c, d, e, &mut f, g, h, a, &mut b, k(MIDS[46]));
+        round(b, c, d, &mut e, f, g, h, &mut a, k(MIDS[47]));
+        round(a, b, c, &mut d, e, f, g, &mut h, k(MIDS[48]));
+        round(h, a, b, &mut c, d, e, f, &mut g, k(MIDS[49]));
+        round(g, h, a, &mut b, c, d, e, &mut f, k(MIDS[50]));
+        round(f, g, h, &mut a, b, c, d, &mut e, k(MIDS[51]));
+        round(e, f, g, &mut h, a, b, c, &mut d, k(MIDS[52]));
+        round(d, e, f, &mut g, h, a, b, &mut c, k(MIDS[53]));
+        round(c, d, e, &mut f, g, h, a, &mut b, k(MIDS[54]));
+        round(b, c, d, &mut e, f, g, h, &mut a, k(MIDS[55]));
+        round(a, b, c, &mut d, e, f, g, &mut h, k(MIDS[56]));
+        round(h, a, b, &mut c, d, e, f, &mut g, k(MIDS[57]));
+        round(g, h, a, &mut b, c, d, e, &mut f, k(MIDS[58]));
+        round(f, g, h, &mut a, b, c, d, &mut e, k(MIDS[59]));
+        round(e, f, g, &mut h, a, b, c, &mut d, k(MIDS[60]));
+        round(d, e, f, &mut g, h, a, b, &mut c, k(MIDS[61]));
+        round(c, d, e, &mut f, g, h, a, &mut b, k(MIDS[62]));
+        round(b, c, d, &mut e, f, g, h, &mut a, k(MIDS[63]));
+
+        // Add Transform 1 output
+        a = add2(a, t0);
+        b = add2(b, t1);
+        c = add2(c, t2);
+        d = add2(d, t3);
+        e = add2(e, t4);
+        f = add2(f, t5);
+        g = add2(g, t6);
+        h = add2(h, t7);
+
+        // Save w0-w7 for Transform 3
+        w0 = a;
+        w1 = b;
+        w2 = c;
+        w3 = d;
+        w4 = e;
+        w5 = f;
+        w6 = g;
+        w7 = h;
+
+        // ---- Transform 3: Second SHA-256 hash (hash of the hash) ----
+        a = iv0;
+        b = iv1;
+        c = iv2;
+        d = iv3;
+        e = iv4;
+        f = iv5;
+        g = iv6;
+        h = iv7;
+
+        // Rounds 0-7: hash of Transform 2 output
+        round(a, b, c, &mut d, e, f, g, &mut h, add2(k(K[0]), w0));
+        round(h, a, b, &mut c, d, e, f, &mut g, add2(k(K[1]), w1));
+        round(g, h, a, &mut b, c, d, e, &mut f, add2(k(K[2]), w2));
+        round(f, g, h, &mut a, b, c, d, &mut e, add2(k(K[3]), w3));
+        round(e, f, g, &mut h, a, b, c, &mut d, add2(k(K[4]), w4));
+        round(d, e, f, &mut g, h, a, b, &mut c, add2(k(K[5]), w5));
+        round(c, d, e, &mut f, g, h, a, &mut b, add2(k(K[6]), w6));
+        round(b, c, d, &mut e, f, g, h, &mut a, add2(k(K[7]), w7));
+
+        // Rounds 8-15: precomputed K + padding constants
+        round(a, b, c, &mut d, e, f, g, &mut h, k(0x5807aa98));
+        round(h, a, b, &mut c, d, e, f, &mut g, k(0x12835b01));
+        round(g, h, a, &mut b, c, d, e, &mut f, k(0x243185be));
+        round(f, g, h, &mut a, b, c, d, &mut e, k(0x550c7dc3));
+        round(e, f, g, &mut h, a, b, c, &mut d, k(0x72be5d74));
+        round(d, e, f, &mut g, h, a, b, &mut c, k(0x80deb1fe));
+        round(c, d, e, &mut f, g, h, a, &mut b, k(0x9bdc06a7));
+        round(b, c, d, &mut e, f, g, h, &mut a, k(0xc19bf274));
+
+        // Rounds 16-31: message schedule with padding constants mixed in.
+        // w0-w7 are modified in place (w0→w16, w1→w17, etc.) so that
+        // subsequent sigma1/sigma0 calls reference updated values.
+        w0 = add2(w0, small_sigma0(w1));
+        round(a, b, c, &mut d, e, f, g, &mut h, add2(k(K[16]), w0));
+        w1 = add3(w1, k(0x00a00000), small_sigma0(w2));
+        round(h, a, b, &mut c, d, e, f, &mut g, add2(k(K[17]), w1));
+        w2 = add3(w2, small_sigma1(w0), small_sigma0(w3));
+        round(g, h, a, &mut b, c, d, e, &mut f, add2(k(K[18]), w2));
+        w3 = add3(w3, small_sigma1(w1), small_sigma0(w4));
+        round(f, g, h, &mut a, b, c, d, &mut e, add2(k(K[19]), w3));
+        w4 = add3(w4, small_sigma1(w2), small_sigma0(w5));
+        round(e, f, g, &mut h, a, b, c, &mut d, add2(k(K[20]), w4));
+        w5 = add3(w5, small_sigma1(w3), small_sigma0(w6));
+        round(d, e, f, &mut g, h, a, b, &mut c, add2(k(K[21]), w5));
+        w6 = add4(w6, small_sigma1(w4), k(0x00000100), small_sigma0(w7));
+        round(c, d, e, &mut f, g, h, a, &mut b, add2(k(K[22]), w6));
+        w7 = add4(w7, small_sigma1(w5), w0, k(0x11002000));
+        round(b, c, d, &mut e, f, g, h, &mut a, add2(k(K[23]), w7));
+        w8 = add3(k(0x80000000), small_sigma1(w6), w1);
+        round(a, b, c, &mut d, e, f, g, &mut h, add2(k(K[24]), w8));
+        w9 = add2(small_sigma1(w7), w2);
+        round(h, a, b, &mut c, d, e, f, &mut g, add2(k(K[25]), w9));
+        w10 = add2(small_sigma1(w8), w3);
+        round(g, h, a, &mut b, c, d, e, &mut f, add2(k(K[26]), w10));
+        w11 = add2(small_sigma1(w9), w4);
+        round(f, g, h, &mut a, b, c, d, &mut e, add2(k(K[27]), w11));
+        w12 = add2(small_sigma1(w10), w5);
+        round(e, f, g, &mut h, a, b, c, &mut d, add2(k(K[28]), w12));
+        w13 = add2(small_sigma1(w11), w6);
+        round(d, e, f, &mut g, h, a, b, &mut c, add2(k(K[29]), w13));
+        w14 = add3(small_sigma1(w12), w7, k(0x00400022));
+        round(c, d, e, &mut f, g, h, a, &mut b, add2(k(K[30]), w14));
+        w15 = add4(k(0x00000100), small_sigma1(w13), w8, small_sigma0(w0));
+        round(b, c, d, &mut e, f, g, h, &mut a, add2(k(K[31]), w15));
+
+        // Rounds 32-63: full message schedule
+        w0 = add4(small_sigma1(w14), w9, small_sigma0(w1), w0);
+        round(a, b, c, &mut d, e, f, g, &mut h, add2(k(K[32]), w0));
+        w1 = add4(small_sigma1(w15), w10, small_sigma0(w2), w1);
+        round(h, a, b, &mut c, d, e, f, &mut g, add2(k(K[33]), w1));
+        w2 = add4(small_sigma1(w0), w11, small_sigma0(w3), w2);
+        round(g, h, a, &mut b, c, d, e, &mut f, add2(k(K[34]), w2));
+        w3 = add4(small_sigma1(w1), w12, small_sigma0(w4), w3);
+        round(f, g, h, &mut a, b, c, d, &mut e, add2(k(K[35]), w3));
+        w4 = add4(small_sigma1(w2), w13, small_sigma0(w5), w4);
+        round(e, f, g, &mut h, a, b, c, &mut d, add2(k(K[36]), w4));
+        w5 = add4(small_sigma1(w3), w14, small_sigma0(w6), w5);
+        round(d, e, f, &mut g, h, a, b, &mut c, add2(k(K[37]), w5));
+        w6 = add4(small_sigma1(w4), w15, small_sigma0(w7), w6);
+        round(c, d, e, &mut f, g, h, a, &mut b, add2(k(K[38]), w6));
+        w7 = add4(small_sigma1(w5), w0, small_sigma0(w8), w7);
+        round(b, c, d, &mut e, f, g, h, &mut a, add2(k(K[39]), w7));
+        w8 = add4(small_sigma1(w6), w1, small_sigma0(w9), w8);
+        round(a, b, c, &mut d, e, f, g, &mut h, add2(k(K[40]), w8));
+        w9 = add4(small_sigma1(w7), w2, small_sigma0(w10), w9);
+        round(h, a, b, &mut c, d, e, f, &mut g, add2(k(K[41]), w9));
+        w10 = add4(small_sigma1(w8), w3, small_sigma0(w11), w10);
+        round(g, h, a, &mut b, c, d, e, &mut f, add2(k(K[42]), w10));
+        w11 = add4(small_sigma1(w9), w4, small_sigma0(w12), w11);
+        round(f, g, h, &mut a, b, c, d, &mut e, add2(k(K[43]), w11));
+        w12 = add4(small_sigma1(w10), w5, small_sigma0(w13), w12);
+        round(e, f, g, &mut h, a, b, c, &mut d, add2(k(K[44]), w12));
+        w13 = add4(small_sigma1(w11), w6, small_sigma0(w14), w13);
+        round(d, e, f, &mut g, h, a, b, &mut c, add2(k(K[45]), w13));
+        w14 = add4(small_sigma1(w12), w7, small_sigma0(w15), w14);
+        round(c, d, e, &mut f, g, h, a, &mut b, add2(k(K[46]), w14));
+        w15 = add4(small_sigma1(w13), w8, small_sigma0(w0), w15);
+        round(b, c, d, &mut e, f, g, h, &mut a, add2(k(K[47]), w15));
+        w0 = add4(small_sigma1(w14), w9, small_sigma0(w1), w0);
+        round(a, b, c, &mut d, e, f, g, &mut h, add2(k(K[48]), w0));
+        w1 = add4(small_sigma1(w15), w10, small_sigma0(w2), w1);
+        round(h, a, b, &mut c, d, e, f, &mut g, add2(k(K[49]), w1));
+        w2 = add4(small_sigma1(w0), w11, small_sigma0(w3), w2);
+        round(g, h, a, &mut b, c, d, e, &mut f, add2(k(K[50]), w2));
+        w3 = add4(small_sigma1(w1), w12, small_sigma0(w4), w3);
+        round(f, g, h, &mut a, b, c, d, &mut e, add2(k(K[51]), w3));
+        w4 = add4(small_sigma1(w2), w13, small_sigma0(w5), w4);
+        round(e, f, g, &mut h, a, b, c, &mut d, add2(k(K[52]), w4));
+        w5 = add4(small_sigma1(w3), w14, small_sigma0(w6), w5);
+        round(d, e, f, &mut g, h, a, b, &mut c, add2(k(K[53]), w5));
+        w6 = add4(small_sigma1(w4), w15, small_sigma0(w7), w6);
+        round(c, d, e, &mut f, g, h, a, &mut b, add2(k(K[54]), w6));
+        w7 = add4(small_sigma1(w5), w0, small_sigma0(w8), w7);
+        round(b, c, d, &mut e, f, g, h, &mut a, add2(k(K[55]), w7));
+        w8 = add4(small_sigma1(w6), w1, small_sigma0(w9), w8);
+        round(a, b, c, &mut d, e, f, g, &mut h, add2(k(K[56]), w8));
+        w9 = add4(small_sigma1(w7), w2, small_sigma0(w10), w9);
+        round(h, a, b, &mut c, d, e, f, &mut g, add2(k(K[57]), w9));
+        w10 = add4(small_sigma1(w8), w3, small_sigma0(w11), w10);
+        round(g, h, a, &mut b, c, d, e, &mut f, add2(k(K[58]), w10));
+        w11 = add4(small_sigma1(w9), w4, small_sigma0(w12), w11);
+        round(f, g, h, &mut a, b, c, d, &mut e, add2(k(K[59]), w11));
+        w12 = add4(small_sigma1(w10), w5, small_sigma0(w13), w12);
+        round(e, f, g, &mut h, a, b, c, &mut d, add2(k(K[60]), w12));
+        w13 = add4(small_sigma1(w11), w6, small_sigma0(w14), w13);
+        round(d, e, f, &mut g, h, a, b, &mut c, add2(k(K[61]), w13));
+        w14 = add4(small_sigma1(w12), w7, small_sigma0(w15), w14);
+        round(c, d, e, &mut f, g, h, a, &mut b, add2(k(K[62]), w14));
+        w15 = add4(small_sigma1(w13), w8, small_sigma0(w0), w15);
+        round(b, c, d, &mut e, f, g, h, &mut a, add2(k(K[63]), w15));
+
+        // Add IV back
+        a = add2(a, iv0);
+        b = add2(b, iv1);
+        c = add2(c, iv2);
+        d = add2(d, iv3);
+        e = add2(e, iv4);
+        f = add2(f, iv5);
+        g = add2(g, iv6);
+        h = add2(h, iv7);
+
+        // Write output
+        let out = output.as_mut_ptr() as *mut u8;
+        write4(out, 0, a, shuf_mask);
+        write4(out, 4, b, shuf_mask);
+        write4(out, 8, c, shuf_mask);
+        write4(out, 12, d, shuf_mask);
+        write4(out, 16, e, shuf_mask);
+        write4(out, 20, f, shuf_mask);
+        write4(out, 24, g, shuf_mask);
+        write4(out, 28, h, shuf_mask);
+    }
+
+    /// Computes SHA256d on eight 64-byte inputs in parallel using AVX2 intrinsics.
+    ///
+    /// Based on Bitcoin Core's `sha256d64_avx2::Transform_8way`.
+    // https://github.com/bitcoin/bitcoin/blob/master/src/crypto/sha256_avx2.cpp
+    #[cfg(all(target_arch = "x86_64", any(feature = "std", feature = "cpufeatures")))]
+    #[target_feature(enable = "avx2")]
+    unsafe fn sha256d_64_avx2_8way(output: &mut [[u8; 32]; 8], input: &[[u8; 64]; 8]) {
+        use core::arch::x86_64::*;
+
+        #[inline(always)]
+        unsafe fn k(x: u32) -> __m256i { _mm256_set1_epi32(x as i32) }
+        #[inline(always)]
+        unsafe fn add2(a: __m256i, b: __m256i) -> __m256i { _mm256_add_epi32(a, b) }
+        #[inline(always)]
+        unsafe fn add3(a: __m256i, b: __m256i, c: __m256i) -> __m256i { add2(add2(a, b), c) }
+        #[inline(always)]
+        unsafe fn add4(a: __m256i, b: __m256i, c: __m256i, d: __m256i) -> __m256i {
+            add2(add2(a, b), add2(c, d))
+        }
+        #[inline(always)]
+        unsafe fn add5(
+            a: __m256i,
+            b: __m256i,
+            c: __m256i,
+            d: __m256i,
+            e: __m256i,
+        ) -> __m256i {
+            add2(add3(a, b, c), add2(d, e))
+        }
+        #[inline(always)]
+        unsafe fn xor2(a: __m256i, b: __m256i) -> __m256i { _mm256_xor_si256(a, b) }
+        #[inline(always)]
+        unsafe fn xor3(a: __m256i, b: __m256i, c: __m256i) -> __m256i { xor2(xor2(a, b), c) }
+        #[inline(always)]
+        unsafe fn or(a: __m256i, b: __m256i) -> __m256i { _mm256_or_si256(a, b) }
+        #[inline(always)]
+        unsafe fn and(a: __m256i, b: __m256i) -> __m256i { _mm256_and_si256(a, b) }
+
+        #[inline(always)]
+        unsafe fn ch(x: __m256i, y: __m256i, z: __m256i) -> __m256i {
+            xor2(z, and(x, xor2(y, z)))
+        }
+        #[inline(always)]
+        unsafe fn maj(x: __m256i, y: __m256i, z: __m256i) -> __m256i {
+            or(and(x, y), and(z, or(x, y)))
+        }
+        #[inline(always)]
+        unsafe fn big_sigma0(x: __m256i) -> __m256i {
+            xor3(
+                or(_mm256_srli_epi32(x, 2), _mm256_slli_epi32(x, 30)),
+                or(_mm256_srli_epi32(x, 13), _mm256_slli_epi32(x, 19)),
+                or(_mm256_srli_epi32(x, 22), _mm256_slli_epi32(x, 10)),
+            )
+        }
+        #[inline(always)]
+        unsafe fn big_sigma1(x: __m256i) -> __m256i {
+            xor3(
+                or(_mm256_srli_epi32(x, 6), _mm256_slli_epi32(x, 26)),
+                or(_mm256_srli_epi32(x, 11), _mm256_slli_epi32(x, 21)),
+                or(_mm256_srli_epi32(x, 25), _mm256_slli_epi32(x, 7)),
+            )
+        }
+        #[inline(always)]
+        unsafe fn small_sigma0(x: __m256i) -> __m256i {
+            xor3(
+                or(_mm256_srli_epi32(x, 7), _mm256_slli_epi32(x, 25)),
+                or(_mm256_srli_epi32(x, 18), _mm256_slli_epi32(x, 14)),
+                _mm256_srli_epi32(x, 3),
+            )
+        }
+        #[inline(always)]
+        unsafe fn small_sigma1(x: __m256i) -> __m256i {
+            xor3(
+                or(_mm256_srli_epi32(x, 17), _mm256_slli_epi32(x, 15)),
+                or(_mm256_srli_epi32(x, 19), _mm256_slli_epi32(x, 13)),
+                _mm256_srli_epi32(x, 10),
+            )
+        }
+
+        #[inline(always)]
+        unsafe fn round(
+            a: __m256i,
+            b: __m256i,
+            c: __m256i,
+            d: &mut __m256i,
+            e: __m256i,
+            f: __m256i,
+            g: __m256i,
+            h: &mut __m256i,
+            ki: __m256i,
+        ) {
+            let t1 = add4(*h, big_sigma1(e), ch(e, f, g), ki);
+            let t2 = add2(big_sigma0(a), maj(a, b, c));
+            *d = add2(*d, t1);
+            *h = add2(t1, t2);
+        }
+
+        #[inline(always)]
+        unsafe fn read8(base: *const u8, offset: usize, shuf: __m256i) -> __m256i {
+            let w0 = (base.add(offset) as *const u32).read_unaligned();
+            let w1 = (base.add(64 + offset) as *const u32).read_unaligned();
+            let w2 = (base.add(128 + offset) as *const u32).read_unaligned();
+            let w3 = (base.add(192 + offset) as *const u32).read_unaligned();
+            let w4 = (base.add(256 + offset) as *const u32).read_unaligned();
+            let w5 = (base.add(320 + offset) as *const u32).read_unaligned();
+            let w6 = (base.add(384 + offset) as *const u32).read_unaligned();
+            let w7 = (base.add(448 + offset) as *const u32).read_unaligned();
+            let ret = _mm256_set_epi32(
+                w0 as i32, w1 as i32, w2 as i32, w3 as i32,
+                w4 as i32, w5 as i32, w6 as i32, w7 as i32,
+            );
+            _mm256_shuffle_epi8(ret, shuf)
+        }
+
+        #[inline(always)]
+        unsafe fn write8(base: *mut u8, offset: usize, v: __m256i, shuf: __m256i) {
+            let v = _mm256_shuffle_epi8(v, shuf);
+            (base.add(offset) as *mut u32)
+                .write_unaligned(_mm256_extract_epi32::<7>(v) as u32);
+            (base.add(32 + offset) as *mut u32)
+                .write_unaligned(_mm256_extract_epi32::<6>(v) as u32);
+            (base.add(64 + offset) as *mut u32)
+                .write_unaligned(_mm256_extract_epi32::<5>(v) as u32);
+            (base.add(96 + offset) as *mut u32)
+                .write_unaligned(_mm256_extract_epi32::<4>(v) as u32);
+            (base.add(128 + offset) as *mut u32)
+                .write_unaligned(_mm256_extract_epi32::<3>(v) as u32);
+            (base.add(160 + offset) as *mut u32)
+                .write_unaligned(_mm256_extract_epi32::<2>(v) as u32);
+            (base.add(192 + offset) as *mut u32)
+                .write_unaligned(_mm256_extract_epi32::<1>(v) as u32);
+            (base.add(224 + offset) as *mut u32)
+                .write_unaligned(_mm256_extract_epi32::<0>(v) as u32);
+        }
+
+        let shuf_mask = _mm256_set_epi32(
+            0x0C0D0E0Fu32 as i32, 0x08090A0Bu32 as i32,
+            0x04050607u32 as i32, 0x00010203u32 as i32,
+            0x0C0D0E0Fu32 as i32, 0x08090A0Bu32 as i32,
+            0x04050607u32 as i32, 0x00010203u32 as i32,
+        );
+
+        #[rustfmt::skip]
+        const K: [u32; 64] = [
+            0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+            0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+            0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+            0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+            0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+            0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+            0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+            0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
+        ];
+
+        #[rustfmt::skip]
+        const MIDS: [u32; 64] = [
+            0xc28a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+            0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf374,
+            0x649b69c1, 0xf0fe4786, 0x0fe1edc6, 0x240cf254, 0x4fe9346f, 0x6cc984be, 0x61b9411e, 0x16f988fa,
+            0xf2c65152, 0xa88e5a6d, 0xb019fc65, 0xb9d99ec7, 0x9a1231c3, 0xe70eeaa0, 0xfdb1232b, 0xc7353eb0,
+            0x3069bad5, 0xcb976d5f, 0x5a0f118f, 0xdc1eeefd, 0x0a35b689, 0xde0b7a04, 0x58f4ca9d, 0xe15d5b16,
+            0x007f3e86, 0x37088980, 0xa507ea32, 0x6fab9537, 0x17406110, 0x0d8cd6f1, 0xcdaa3b6d, 0xc0bbbe37,
+            0x83613bda, 0xdb48a363, 0x0b02e931, 0x6fd15ca7, 0x521afaca, 0x31338431, 0x6ed41a95, 0x6d437890,
+            0xc39c91f2, 0x9eccabbd, 0xb5c9a0e6, 0x532fb63c, 0xd2c741c6, 0x07237ea3, 0xa4954b68, 0x4c191d76,
+        ];
+
+        let inp = input.as_ptr() as *const u8;
+
+        // SHA-256 initial hash value
+        let iv0 = k(0x6a09e667);
+        let iv1 = k(0xbb67ae85);
+        let iv2 = k(0x3c6ef372);
+        let iv3 = k(0xa54ff53a);
+        let iv4 = k(0x510e527f);
+        let iv5 = k(0x9b05688c);
+        let iv6 = k(0x1f83d9ab);
+        let iv7 = k(0x5be0cd19);
+
+        // ---- Transform 1: SHA-256 of the 64-byte input blocks ----
+        let mut a = iv0;
+        let mut b = iv1;
+        let mut c = iv2;
+        let mut d = iv3;
+        let mut e = iv4;
+        let mut f = iv5;
+        let mut g = iv6;
+        let mut h = iv7;
+
+        // Load message words
+        let mut w0 = read8(inp, 4 * 0, shuf_mask);
+        let mut w1 = read8(inp, 4 * 1, shuf_mask);
+        let mut w2 = read8(inp, 4 * 2, shuf_mask);
+        let mut w3 = read8(inp, 4 * 3, shuf_mask);
+        let mut w4 = read8(inp, 4 * 4, shuf_mask);
+        let mut w5 = read8(inp, 4 * 5, shuf_mask);
+        let mut w6 = read8(inp, 4 * 6, shuf_mask);
+        let mut w7 = read8(inp, 4 * 7, shuf_mask);
+        let mut w8 = read8(inp, 4 * 8, shuf_mask);
+        let mut w9 = read8(inp, 4 * 9, shuf_mask);
+        let mut w10 = read8(inp, 4 * 10, shuf_mask);
+        let mut w11 = read8(inp, 4 * 11, shuf_mask);
+        let mut w12 = read8(inp, 4 * 12, shuf_mask);
+        let mut w13 = read8(inp, 4 * 13, shuf_mask);
+        let mut w14 = read8(inp, 4 * 14, shuf_mask);
+        let mut w15 = read8(inp, 4 * 15, shuf_mask);
+
+        // Rounds 0-15
+        round(a, b, c, &mut d, e, f, g, &mut h, add2(k(K[0]), w0));
+        round(h, a, b, &mut c, d, e, f, &mut g, add2(k(K[1]), w1));
+        round(g, h, a, &mut b, c, d, e, &mut f, add2(k(K[2]), w2));
+        round(f, g, h, &mut a, b, c, d, &mut e, add2(k(K[3]), w3));
+        round(e, f, g, &mut h, a, b, c, &mut d, add2(k(K[4]), w4));
+        round(d, e, f, &mut g, h, a, b, &mut c, add2(k(K[5]), w5));
+        round(c, d, e, &mut f, g, h, a, &mut b, add2(k(K[6]), w6));
+        round(b, c, d, &mut e, f, g, h, &mut a, add2(k(K[7]), w7));
+        round(a, b, c, &mut d, e, f, g, &mut h, add2(k(K[8]), w8));
+        round(h, a, b, &mut c, d, e, f, &mut g, add2(k(K[9]), w9));
+        round(g, h, a, &mut b, c, d, e, &mut f, add2(k(K[10]), w10));
+        round(f, g, h, &mut a, b, c, d, &mut e, add2(k(K[11]), w11));
+        round(e, f, g, &mut h, a, b, c, &mut d, add2(k(K[12]), w12));
+        round(d, e, f, &mut g, h, a, b, &mut c, add2(k(K[13]), w13));
+        round(c, d, e, &mut f, g, h, a, &mut b, add2(k(K[14]), w14));
+        round(b, c, d, &mut e, f, g, h, &mut a, add2(k(K[15]), w15));
+
+        // Rounds 16-63 with message schedule
+        w0 = add4(small_sigma1(w14), w9, small_sigma0(w1), w0);
+        round(a, b, c, &mut d, e, f, g, &mut h, add2(k(K[16]), w0));
+        w1 = add4(small_sigma1(w15), w10, small_sigma0(w2), w1);
+        round(h, a, b, &mut c, d, e, f, &mut g, add2(k(K[17]), w1));
+        w2 = add4(small_sigma1(w0), w11, small_sigma0(w3), w2);
+        round(g, h, a, &mut b, c, d, e, &mut f, add2(k(K[18]), w2));
+        w3 = add4(small_sigma1(w1), w12, small_sigma0(w4), w3);
+        round(f, g, h, &mut a, b, c, d, &mut e, add2(k(K[19]), w3));
+        w4 = add4(small_sigma1(w2), w13, small_sigma0(w5), w4);
+        round(e, f, g, &mut h, a, b, c, &mut d, add2(k(K[20]), w4));
+        w5 = add4(small_sigma1(w3), w14, small_sigma0(w6), w5);
+        round(d, e, f, &mut g, h, a, b, &mut c, add2(k(K[21]), w5));
+        w6 = add4(small_sigma1(w4), w15, small_sigma0(w7), w6);
+        round(c, d, e, &mut f, g, h, a, &mut b, add2(k(K[22]), w6));
+        w7 = add4(small_sigma1(w5), w0, small_sigma0(w8), w7);
+        round(b, c, d, &mut e, f, g, h, &mut a, add2(k(K[23]), w7));
+        w8 = add4(small_sigma1(w6), w1, small_sigma0(w9), w8);
+        round(a, b, c, &mut d, e, f, g, &mut h, add2(k(K[24]), w8));
+        w9 = add4(small_sigma1(w7), w2, small_sigma0(w10), w9);
+        round(h, a, b, &mut c, d, e, f, &mut g, add2(k(K[25]), w9));
+        w10 = add4(small_sigma1(w8), w3, small_sigma0(w11), w10);
+        round(g, h, a, &mut b, c, d, e, &mut f, add2(k(K[26]), w10));
+        w11 = add4(small_sigma1(w9), w4, small_sigma0(w12), w11);
+        round(f, g, h, &mut a, b, c, d, &mut e, add2(k(K[27]), w11));
+        w12 = add4(small_sigma1(w10), w5, small_sigma0(w13), w12);
+        round(e, f, g, &mut h, a, b, c, &mut d, add2(k(K[28]), w12));
+        w13 = add4(small_sigma1(w11), w6, small_sigma0(w14), w13);
+        round(d, e, f, &mut g, h, a, b, &mut c, add2(k(K[29]), w13));
+        w14 = add4(small_sigma1(w12), w7, small_sigma0(w15), w14);
+        round(c, d, e, &mut f, g, h, a, &mut b, add2(k(K[30]), w14));
+        w15 = add4(small_sigma1(w13), w8, small_sigma0(w0), w15);
+        round(b, c, d, &mut e, f, g, h, &mut a, add2(k(K[31]), w15));
+        w0 = add4(small_sigma1(w14), w9, small_sigma0(w1), w0);
+        round(a, b, c, &mut d, e, f, g, &mut h, add2(k(K[32]), w0));
+        w1 = add4(small_sigma1(w15), w10, small_sigma0(w2), w1);
+        round(h, a, b, &mut c, d, e, f, &mut g, add2(k(K[33]), w1));
+        w2 = add4(small_sigma1(w0), w11, small_sigma0(w3), w2);
+        round(g, h, a, &mut b, c, d, e, &mut f, add2(k(K[34]), w2));
+        w3 = add4(small_sigma1(w1), w12, small_sigma0(w4), w3);
+        round(f, g, h, &mut a, b, c, d, &mut e, add2(k(K[35]), w3));
+        w4 = add4(small_sigma1(w2), w13, small_sigma0(w5), w4);
+        round(e, f, g, &mut h, a, b, c, &mut d, add2(k(K[36]), w4));
+        w5 = add4(small_sigma1(w3), w14, small_sigma0(w6), w5);
+        round(d, e, f, &mut g, h, a, b, &mut c, add2(k(K[37]), w5));
+        w6 = add4(small_sigma1(w4), w15, small_sigma0(w7), w6);
+        round(c, d, e, &mut f, g, h, a, &mut b, add2(k(K[38]), w6));
+        w7 = add4(small_sigma1(w5), w0, small_sigma0(w8), w7);
+        round(b, c, d, &mut e, f, g, h, &mut a, add2(k(K[39]), w7));
+        w8 = add4(small_sigma1(w6), w1, small_sigma0(w9), w8);
+        round(a, b, c, &mut d, e, f, g, &mut h, add2(k(K[40]), w8));
+        w9 = add4(small_sigma1(w7), w2, small_sigma0(w10), w9);
+        round(h, a, b, &mut c, d, e, f, &mut g, add2(k(K[41]), w9));
+        w10 = add4(small_sigma1(w8), w3, small_sigma0(w11), w10);
+        round(g, h, a, &mut b, c, d, e, &mut f, add2(k(K[42]), w10));
+        w11 = add4(small_sigma1(w9), w4, small_sigma0(w12), w11);
+        round(f, g, h, &mut a, b, c, d, &mut e, add2(k(K[43]), w11));
+        w12 = add4(small_sigma1(w10), w5, small_sigma0(w13), w12);
+        round(e, f, g, &mut h, a, b, c, &mut d, add2(k(K[44]), w12));
+        w13 = add4(small_sigma1(w11), w6, small_sigma0(w14), w13);
+        round(d, e, f, &mut g, h, a, b, &mut c, add2(k(K[45]), w13));
+        w14 = add4(small_sigma1(w12), w7, small_sigma0(w15), w14);
+        round(c, d, e, &mut f, g, h, a, &mut b, add2(k(K[46]), w14));
+        w15 = add4(small_sigma1(w13), w8, small_sigma0(w0), w15);
+        round(b, c, d, &mut e, f, g, h, &mut a, add2(k(K[47]), w15));
+        w0 = add4(small_sigma1(w14), w9, small_sigma0(w1), w0);
+        round(a, b, c, &mut d, e, f, g, &mut h, add2(k(K[48]), w0));
+        w1 = add4(small_sigma1(w15), w10, small_sigma0(w2), w1);
+        round(h, a, b, &mut c, d, e, f, &mut g, add2(k(K[49]), w1));
+        w2 = add4(small_sigma1(w0), w11, small_sigma0(w3), w2);
+        round(g, h, a, &mut b, c, d, e, &mut f, add2(k(K[50]), w2));
+        w3 = add4(small_sigma1(w1), w12, small_sigma0(w4), w3);
+        round(f, g, h, &mut a, b, c, d, &mut e, add2(k(K[51]), w3));
+        w4 = add4(small_sigma1(w2), w13, small_sigma0(w5), w4);
+        round(e, f, g, &mut h, a, b, c, &mut d, add2(k(K[52]), w4));
+        w5 = add4(small_sigma1(w3), w14, small_sigma0(w6), w5);
+        round(d, e, f, &mut g, h, a, b, &mut c, add2(k(K[53]), w5));
+        w6 = add4(small_sigma1(w4), w15, small_sigma0(w7), w6);
+        round(c, d, e, &mut f, g, h, a, &mut b, add2(k(K[54]), w6));
+        w7 = add4(small_sigma1(w5), w0, small_sigma0(w8), w7);
+        round(b, c, d, &mut e, f, g, h, &mut a, add2(k(K[55]), w7));
+        w8 = add4(small_sigma1(w6), w1, small_sigma0(w9), w8);
+        round(a, b, c, &mut d, e, f, g, &mut h, add2(k(K[56]), w8));
+        w9 = add4(small_sigma1(w7), w2, small_sigma0(w10), w9);
+        round(h, a, b, &mut c, d, e, f, &mut g, add2(k(K[57]), w9));
+        w10 = add4(small_sigma1(w8), w3, small_sigma0(w11), w10);
+        round(g, h, a, &mut b, c, d, e, &mut f, add2(k(K[58]), w10));
+        w11 = add4(small_sigma1(w9), w4, small_sigma0(w12), w11);
+        round(f, g, h, &mut a, b, c, d, &mut e, add2(k(K[59]), w11));
+        w12 = add4(small_sigma1(w10), w5, small_sigma0(w13), w12);
+        round(e, f, g, &mut h, a, b, c, &mut d, add2(k(K[60]), w12));
+        w13 = add4(small_sigma1(w11), w6, small_sigma0(w14), w13);
+        round(d, e, f, &mut g, h, a, b, &mut c, add2(k(K[61]), w13));
+        w14 = add4(small_sigma1(w12), w7, small_sigma0(w15), w14);
+        round(c, d, e, &mut f, g, h, a, &mut b, add2(k(K[62]), w14));
+        w15 = add4(small_sigma1(w13), w8, small_sigma0(w0), w15);
+        round(b, c, d, &mut e, f, g, h, &mut a, add2(k(K[63]), w15));
+
+        // Add IV back
+        a = add2(a, iv0);
+        b = add2(b, iv1);
+        c = add2(c, iv2);
+        d = add2(d, iv3);
+        e = add2(e, iv4);
+        f = add2(f, iv5);
+        g = add2(g, iv6);
+        h = add2(h, iv7);
+
+        // Save Transform 1 output
+        let t0 = a;
+        let t1 = b;
+        let t2 = c;
+        let t3 = d;
+        let t4 = e;
+        let t5 = f;
+        let t6 = g;
+        let t7 = h;
+
+        // ---- Transform 2: SHA-256 of midstate padding ----
+        // State carries over from Transform 1 (NOT reset to IV).
+        // MIDS = precomputed K + W for the padding block after a 64-byte input.
+
+        // All 64 rounds with MIDS constants (precomputed K + padding)
+        round(a, b, c, &mut d, e, f, g, &mut h, k(MIDS[0]));
+        round(h, a, b, &mut c, d, e, f, &mut g, k(MIDS[1]));
+        round(g, h, a, &mut b, c, d, e, &mut f, k(MIDS[2]));
+        round(f, g, h, &mut a, b, c, d, &mut e, k(MIDS[3]));
+        round(e, f, g, &mut h, a, b, c, &mut d, k(MIDS[4]));
+        round(d, e, f, &mut g, h, a, b, &mut c, k(MIDS[5]));
+        round(c, d, e, &mut f, g, h, a, &mut b, k(MIDS[6]));
+        round(b, c, d, &mut e, f, g, h, &mut a, k(MIDS[7]));
+        round(a, b, c, &mut d, e, f, g, &mut h, k(MIDS[8]));
+        round(h, a, b, &mut c, d, e, f, &mut g, k(MIDS[9]));
+        round(g, h, a, &mut b, c, d, e, &mut f, k(MIDS[10]));
+        round(f, g, h, &mut a, b, c, d, &mut e, k(MIDS[11]));
+        round(e, f, g, &mut h, a, b, c, &mut d, k(MIDS[12]));
+        round(d, e, f, &mut g, h, a, b, &mut c, k(MIDS[13]));
+        round(c, d, e, &mut f, g, h, a, &mut b, k(MIDS[14]));
+        round(b, c, d, &mut e, f, g, h, &mut a, k(MIDS[15]));
+        round(a, b, c, &mut d, e, f, g, &mut h, k(MIDS[16]));
+        round(h, a, b, &mut c, d, e, f, &mut g, k(MIDS[17]));
+        round(g, h, a, &mut b, c, d, e, &mut f, k(MIDS[18]));
+        round(f, g, h, &mut a, b, c, d, &mut e, k(MIDS[19]));
+        round(e, f, g, &mut h, a, b, c, &mut d, k(MIDS[20]));
+        round(d, e, f, &mut g, h, a, b, &mut c, k(MIDS[21]));
+        round(c, d, e, &mut f, g, h, a, &mut b, k(MIDS[22]));
+        round(b, c, d, &mut e, f, g, h, &mut a, k(MIDS[23]));
+        round(a, b, c, &mut d, e, f, g, &mut h, k(MIDS[24]));
+        round(h, a, b, &mut c, d, e, f, &mut g, k(MIDS[25]));
+        round(g, h, a, &mut b, c, d, e, &mut f, k(MIDS[26]));
+        round(f, g, h, &mut a, b, c, d, &mut e, k(MIDS[27]));
+        round(e, f, g, &mut h, a, b, c, &mut d, k(MIDS[28]));
+        round(d, e, f, &mut g, h, a, b, &mut c, k(MIDS[29]));
+        round(c, d, e, &mut f, g, h, a, &mut b, k(MIDS[30]));
+        round(b, c, d, &mut e, f, g, h, &mut a, k(MIDS[31]));
+        round(a, b, c, &mut d, e, f, g, &mut h, k(MIDS[32]));
+        round(h, a, b, &mut c, d, e, f, &mut g, k(MIDS[33]));
+        round(g, h, a, &mut b, c, d, e, &mut f, k(MIDS[34]));
+        round(f, g, h, &mut a, b, c, d, &mut e, k(MIDS[35]));
+        round(e, f, g, &mut h, a, b, c, &mut d, k(MIDS[36]));
+        round(d, e, f, &mut g, h, a, b, &mut c, k(MIDS[37]));
+        round(c, d, e, &mut f, g, h, a, &mut b, k(MIDS[38]));
+        round(b, c, d, &mut e, f, g, h, &mut a, k(MIDS[39]));
+        round(a, b, c, &mut d, e, f, g, &mut h, k(MIDS[40]));
+        round(h, a, b, &mut c, d, e, f, &mut g, k(MIDS[41]));
+        round(g, h, a, &mut b, c, d, e, &mut f, k(MIDS[42]));
+        round(f, g, h, &mut a, b, c, d, &mut e, k(MIDS[43]));
+        round(e, f, g, &mut h, a, b, c, &mut d, k(MIDS[44]));
+        round(d, e, f, &mut g, h, a, b, &mut c, k(MIDS[45]));
+        round(c, d, e, &mut f, g, h, a, &mut b, k(MIDS[46]));
+        round(b, c, d, &mut e, f, g, h, &mut a, k(MIDS[47]));
+        round(a, b, c, &mut d, e, f, g, &mut h, k(MIDS[48]));
+        round(h, a, b, &mut c, d, e, f, &mut g, k(MIDS[49]));
+        round(g, h, a, &mut b, c, d, e, &mut f, k(MIDS[50]));
+        round(f, g, h, &mut a, b, c, d, &mut e, k(MIDS[51]));
+        round(e, f, g, &mut h, a, b, c, &mut d, k(MIDS[52]));
+        round(d, e, f, &mut g, h, a, b, &mut c, k(MIDS[53]));
+        round(c, d, e, &mut f, g, h, a, &mut b, k(MIDS[54]));
+        round(b, c, d, &mut e, f, g, h, &mut a, k(MIDS[55]));
+        round(a, b, c, &mut d, e, f, g, &mut h, k(MIDS[56]));
+        round(h, a, b, &mut c, d, e, f, &mut g, k(MIDS[57]));
+        round(g, h, a, &mut b, c, d, e, &mut f, k(MIDS[58]));
+        round(f, g, h, &mut a, b, c, d, &mut e, k(MIDS[59]));
+        round(e, f, g, &mut h, a, b, c, &mut d, k(MIDS[60]));
+        round(d, e, f, &mut g, h, a, b, &mut c, k(MIDS[61]));
+        round(c, d, e, &mut f, g, h, a, &mut b, k(MIDS[62]));
+        round(b, c, d, &mut e, f, g, h, &mut a, k(MIDS[63]));
+
+        // Add Transform 1 output
+        a = add2(a, t0);
+        b = add2(b, t1);
+        c = add2(c, t2);
+        d = add2(d, t3);
+        e = add2(e, t4);
+        f = add2(f, t5);
+        g = add2(g, t6);
+        h = add2(h, t7);
+
+        // Save w0-w7 for Transform 3
+        w0 = a;
+        w1 = b;
+        w2 = c;
+        w3 = d;
+        w4 = e;
+        w5 = f;
+        w6 = g;
+        w7 = h;
+
+        // ---- Transform 3: Second SHA-256 hash (hash of the hash) ----
+        a = iv0;
+        b = iv1;
+        c = iv2;
+        d = iv3;
+        e = iv4;
+        f = iv5;
+        g = iv6;
+        h = iv7;
+
+        // Rounds 0-7: hash of Transform 2 output
+        round(a, b, c, &mut d, e, f, g, &mut h, add2(k(K[0]), w0));
+        round(h, a, b, &mut c, d, e, f, &mut g, add2(k(K[1]), w1));
+        round(g, h, a, &mut b, c, d, e, &mut f, add2(k(K[2]), w2));
+        round(f, g, h, &mut a, b, c, d, &mut e, add2(k(K[3]), w3));
+        round(e, f, g, &mut h, a, b, c, &mut d, add2(k(K[4]), w4));
+        round(d, e, f, &mut g, h, a, b, &mut c, add2(k(K[5]), w5));
+        round(c, d, e, &mut f, g, h, a, &mut b, add2(k(K[6]), w6));
+        round(b, c, d, &mut e, f, g, h, &mut a, add2(k(K[7]), w7));
+
+        // Rounds 8-15: precomputed K + padding constants
+        round(a, b, c, &mut d, e, f, g, &mut h, k(0x5807aa98));
+        round(h, a, b, &mut c, d, e, f, &mut g, k(0x12835b01));
+        round(g, h, a, &mut b, c, d, e, &mut f, k(0x243185be));
+        round(f, g, h, &mut a, b, c, d, &mut e, k(0x550c7dc3));
+        round(e, f, g, &mut h, a, b, c, &mut d, k(0x72be5d74));
+        round(d, e, f, &mut g, h, a, b, &mut c, k(0x80deb1fe));
+        round(c, d, e, &mut f, g, h, a, &mut b, k(0x9bdc06a7));
+        round(b, c, d, &mut e, f, g, h, &mut a, k(0xc19bf274));
+
+        // Rounds 16-31: message schedule with padding constants mixed in.
+        // w0-w7 are modified in place (w0→w16, w1→w17, etc.) so that
+        // subsequent sigma1/sigma0 calls reference updated values.
+        w0 = add2(w0, small_sigma0(w1));
+        round(a, b, c, &mut d, e, f, g, &mut h, add2(k(K[16]), w0));
+        w1 = add3(w1, k(0x00a00000), small_sigma0(w2));
+        round(h, a, b, &mut c, d, e, f, &mut g, add2(k(K[17]), w1));
+        w2 = add3(w2, small_sigma1(w0), small_sigma0(w3));
+        round(g, h, a, &mut b, c, d, e, &mut f, add2(k(K[18]), w2));
+        w3 = add3(w3, small_sigma1(w1), small_sigma0(w4));
+        round(f, g, h, &mut a, b, c, d, &mut e, add2(k(K[19]), w3));
+        w4 = add3(w4, small_sigma1(w2), small_sigma0(w5));
+        round(e, f, g, &mut h, a, b, c, &mut d, add2(k(K[20]), w4));
+        w5 = add3(w5, small_sigma1(w3), small_sigma0(w6));
+        round(d, e, f, &mut g, h, a, b, &mut c, add2(k(K[21]), w5));
+        w6 = add4(w6, small_sigma1(w4), k(0x00000100), small_sigma0(w7));
+        round(c, d, e, &mut f, g, h, a, &mut b, add2(k(K[22]), w6));
+        w7 = add4(w7, small_sigma1(w5), w0, k(0x11002000));
+        round(b, c, d, &mut e, f, g, h, &mut a, add2(k(K[23]), w7));
+        w8 = add3(k(0x80000000), small_sigma1(w6), w1);
+        round(a, b, c, &mut d, e, f, g, &mut h, add2(k(K[24]), w8));
+        w9 = add2(small_sigma1(w7), w2);
+        round(h, a, b, &mut c, d, e, f, &mut g, add2(k(K[25]), w9));
+        w10 = add2(small_sigma1(w8), w3);
+        round(g, h, a, &mut b, c, d, e, &mut f, add2(k(K[26]), w10));
+        w11 = add2(small_sigma1(w9), w4);
+        round(f, g, h, &mut a, b, c, d, &mut e, add2(k(K[27]), w11));
+        w12 = add2(small_sigma1(w10), w5);
+        round(e, f, g, &mut h, a, b, c, &mut d, add2(k(K[28]), w12));
+        w13 = add2(small_sigma1(w11), w6);
+        round(d, e, f, &mut g, h, a, b, &mut c, add2(k(K[29]), w13));
+        w14 = add3(small_sigma1(w12), w7, k(0x00400022));
+        round(c, d, e, &mut f, g, h, a, &mut b, add2(k(K[30]), w14));
+        w15 = add4(k(0x00000100), small_sigma1(w13), w8, small_sigma0(w0));
+        round(b, c, d, &mut e, f, g, h, &mut a, add2(k(K[31]), w15));
+
+        // Rounds 32-63: full message schedule
+        w0 = add4(small_sigma1(w14), w9, small_sigma0(w1), w0);
+        round(a, b, c, &mut d, e, f, g, &mut h, add2(k(K[32]), w0));
+        w1 = add4(small_sigma1(w15), w10, small_sigma0(w2), w1);
+        round(h, a, b, &mut c, d, e, f, &mut g, add2(k(K[33]), w1));
+        w2 = add4(small_sigma1(w0), w11, small_sigma0(w3), w2);
+        round(g, h, a, &mut b, c, d, e, &mut f, add2(k(K[34]), w2));
+        w3 = add4(small_sigma1(w1), w12, small_sigma0(w4), w3);
+        round(f, g, h, &mut a, b, c, d, &mut e, add2(k(K[35]), w3));
+        w4 = add4(small_sigma1(w2), w13, small_sigma0(w5), w4);
+        round(e, f, g, &mut h, a, b, c, &mut d, add2(k(K[36]), w4));
+        w5 = add4(small_sigma1(w3), w14, small_sigma0(w6), w5);
+        round(d, e, f, &mut g, h, a, b, &mut c, add2(k(K[37]), w5));
+        w6 = add4(small_sigma1(w4), w15, small_sigma0(w7), w6);
+        round(c, d, e, &mut f, g, h, a, &mut b, add2(k(K[38]), w6));
+        w7 = add4(small_sigma1(w5), w0, small_sigma0(w8), w7);
+        round(b, c, d, &mut e, f, g, h, &mut a, add2(k(K[39]), w7));
+        w8 = add4(small_sigma1(w6), w1, small_sigma0(w9), w8);
+        round(a, b, c, &mut d, e, f, g, &mut h, add2(k(K[40]), w8));
+        w9 = add4(small_sigma1(w7), w2, small_sigma0(w10), w9);
+        round(h, a, b, &mut c, d, e, f, &mut g, add2(k(K[41]), w9));
+        w10 = add4(small_sigma1(w8), w3, small_sigma0(w11), w10);
+        round(g, h, a, &mut b, c, d, e, &mut f, add2(k(K[42]), w10));
+        w11 = add4(small_sigma1(w9), w4, small_sigma0(w12), w11);
+        round(f, g, h, &mut a, b, c, d, &mut e, add2(k(K[43]), w11));
+        w12 = add4(small_sigma1(w10), w5, small_sigma0(w13), w12);
+        round(e, f, g, &mut h, a, b, c, &mut d, add2(k(K[44]), w12));
+        w13 = add4(small_sigma1(w11), w6, small_sigma0(w14), w13);
+        round(d, e, f, &mut g, h, a, b, &mut c, add2(k(K[45]), w13));
+        w14 = add4(small_sigma1(w12), w7, small_sigma0(w15), w14);
+        round(c, d, e, &mut f, g, h, a, &mut b, add2(k(K[46]), w14));
+        w15 = add4(small_sigma1(w13), w8, small_sigma0(w0), w15);
+        round(b, c, d, &mut e, f, g, h, &mut a, add2(k(K[47]), w15));
+        w0 = add4(small_sigma1(w14), w9, small_sigma0(w1), w0);
+        round(a, b, c, &mut d, e, f, g, &mut h, add2(k(K[48]), w0));
+        w1 = add4(small_sigma1(w15), w10, small_sigma0(w2), w1);
+        round(h, a, b, &mut c, d, e, f, &mut g, add2(k(K[49]), w1));
+        w2 = add4(small_sigma1(w0), w11, small_sigma0(w3), w2);
+        round(g, h, a, &mut b, c, d, e, &mut f, add2(k(K[50]), w2));
+        w3 = add4(small_sigma1(w1), w12, small_sigma0(w4), w3);
+        round(f, g, h, &mut a, b, c, d, &mut e, add2(k(K[51]), w3));
+        w4 = add4(small_sigma1(w2), w13, small_sigma0(w5), w4);
+        round(e, f, g, &mut h, a, b, c, &mut d, add2(k(K[52]), w4));
+        w5 = add4(small_sigma1(w3), w14, small_sigma0(w6), w5);
+        round(d, e, f, &mut g, h, a, b, &mut c, add2(k(K[53]), w5));
+        w6 = add4(small_sigma1(w4), w15, small_sigma0(w7), w6);
+        round(c, d, e, &mut f, g, h, a, &mut b, add2(k(K[54]), w6));
+        w7 = add4(small_sigma1(w5), w0, small_sigma0(w8), w7);
+        round(b, c, d, &mut e, f, g, h, &mut a, add2(k(K[55]), w7));
+        w8 = add4(small_sigma1(w6), w1, small_sigma0(w9), w8);
+        round(a, b, c, &mut d, e, f, g, &mut h, add2(k(K[56]), w8));
+        w9 = add4(small_sigma1(w7), w2, small_sigma0(w10), w9);
+        round(h, a, b, &mut c, d, e, f, &mut g, add2(k(K[57]), w9));
+        w10 = add4(small_sigma1(w8), w3, small_sigma0(w11), w10);
+        round(g, h, a, &mut b, c, d, e, &mut f, add2(k(K[58]), w10));
+        w11 = add4(small_sigma1(w9), w4, small_sigma0(w12), w11);
+        round(f, g, h, &mut a, b, c, d, &mut e, add2(k(K[59]), w11));
+        w12 = add4(small_sigma1(w10), w5, small_sigma0(w13), w12);
+        round(e, f, g, &mut h, a, b, c, &mut d, add2(k(K[60]), w12));
+        w13 = add4(small_sigma1(w11), w6, small_sigma0(w14), w13);
+        round(d, e, f, &mut g, h, a, b, &mut c, add2(k(K[61]), w13));
+        w14 = add4(small_sigma1(w12), w7, small_sigma0(w15), w14);
+        round(c, d, e, &mut f, g, h, a, &mut b, add2(k(K[62]), w14));
+        w15 = add4(small_sigma1(w13), w8, small_sigma0(w0), w15);
+        round(b, c, d, &mut e, f, g, h, &mut a, add2(k(K[63]), w15));
+
+        // Add IV back
+        a = add2(a, iv0);
+        b = add2(b, iv1);
+        c = add2(c, iv2);
+        d = add2(d, iv3);
+        e = add2(e, iv4);
+        f = add2(f, iv5);
+        g = add2(g, iv6);
+        h = add2(h, iv7);
+
+        // Write output
+        let out = output.as_mut_ptr() as *mut u8;
+        write8(out, 0, a, shuf_mask);
+        write8(out, 4, b, shuf_mask);
+        write8(out, 8, c, shuf_mask);
+        write8(out, 12, d, shuf_mask);
+        write8(out, 16, e, shuf_mask);
+        write8(out, 20, f, shuf_mask);
+        write8(out, 24, g, shuf_mask);
+        write8(out, 28, h, shuf_mask);
     }
 
     #[cfg(all(target_arch = "aarch64", any(feature = "std", feature = "cpufeatures")))]
