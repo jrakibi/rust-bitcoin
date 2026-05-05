@@ -579,6 +579,7 @@ impl HashEngine {
     }
 
     // Optimized scalar SHA256d of a single 64-byte input.
+    #[rustfmt::skip]
     pub(crate) fn software_sha256d_64(out: &mut [u8; 32], input: &[u8; 64]) {
         let mut w = [0u32; 16];
         for (w_val, buff_bytes) in w.iter_mut().zip(input.bitcoin_as_chunks::<4>().0) {
