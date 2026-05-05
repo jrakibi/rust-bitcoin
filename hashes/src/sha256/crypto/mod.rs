@@ -24,7 +24,6 @@ mod avx2;
 use internals::slice::SliceExt;
 
 use super::{HashEngine, Midstate, BLOCK_SIZE};
-use crate::sha256d;
 
 #[cfg(feature = "cpufeatures")]
 #[cfg(target_arch = "aarch64")]
@@ -475,7 +474,7 @@ impl HashEngine {
 
         // fallback
         while i < count {
-            outputs[i] = sha256d::hash(&inputs[i]).to_byte_array();
+            Self::software_sha256d_64(&mut outputs[i], &inputs[i]);
             i += 1;
         }
     }
