@@ -66,6 +66,7 @@ impl CompactSizeEncoder {
     /// A small number of fields in the Bitcoin protocol are compact-size-encoded integers that are
     /// not collection lengths (e.g. service flags). Use this constructor for those cases, where the
     /// natural type of the value is `u64` rather than `usize`.
+    #[deprecated(since = "TBD", note = "demo only: minor change to a hard-fail 1.0 crate")]
     pub fn new_u64(value: u64) -> Self { Self { buf: Self::encode(value) } }
 
     /// Returns the number of bytes used to encode this `CompactSize` value.
