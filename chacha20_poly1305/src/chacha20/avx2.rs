@@ -228,15 +228,13 @@ pub(super) unsafe fn apply_8_blocks(
     w14 = arch::_mm256_add_epi32(w14, init14);
     w15 = arch::_mm256_add_epi32(w15, init15);
 
-    // Transpose and XOR each row of the state into the ciphertext.
-    xor_into(chunk, 0, w0, w1, w2, w3); // bytes  0..16 of each block
-    xor_into(chunk, 16, w4, w5, w6, w7); // bytes 16..32
-    xor_into(chunk, 32, w8, w9, w10, w11); // bytes 32..48
-    xor_into(chunk, 48, w12, w13, w14, w15); // bytes 48..64
+    // Transpose pairs of rows and XOR 32 bytes of each block at a time.
+    xor_into(chunk, 0, (w0, w1, w2, w3), (w4, w5, w6, w7));
+    xor_into(chunk, 32, (w8, w9, w10, w11), (w12, w13, w14, w15));
 }
 
-// This function handles the final step of applying the keystream to the
-// ciphertext as outlined in the RFC: https://datatracker.ietf.org/doc/html/rfc7539#section-2.4.1
+// Transpose four state words into a 16-byte keystream row for each block,
+// ready to be applied as described in https://datatracker.ietf.org/doc/html/rfc7539#section-2.4.1.
 //
 // Suppose a chacha state is made up of words [w0,..., w15].
 // We are processing 8 blocks, [b0, ..., b7].
@@ -250,21 +248,14 @@ pub(super) unsafe fn apply_8_blocks(
 // words into four `__m256i`s, each holding complete 128-bit rows for two
 // blocks. For example, the first result holds:
 //   [b0.w0, b0.w1, b0.w2, b0.w3, b4.w0, b4.w1, b4.w2, b4.w3]
-// where the low half is block 0's row and the high half is block 4's. The
-// halves are then split into eight 128-bit rows ordered by block number.
+// where the low half is block 0's row and the high half is block 4's.
+// `xor_into` combines these halves with the corresponding halves of the
+// next row to obtain 32 contiguous keystream bytes for each block.
 //
 // SAFETY: AVX2 intrinsics are gated by target feature `avx2`, and the caller
 // must ensure AVX2 is available on the current CPU.
 #[inline(always)]
-#[allow(clippy::cast_ptr_alignment)]
-unsafe fn xor_into(
-    chunk: &mut [u8; 8 * 64],
-    offset: usize,
-    w0: Word,
-    w1: Word,
-    w2: Word,
-    w3: Word,
-) {
+unsafe fn transpose_row((w0, w1, w2, w3): StateRow) -> StateRow {
     // `_mm256_unpacklo_epi32` interleaves the lower halves of its inputs:
     // [a, b, c, d] and [e, f, g, h] become [a, e, b, f].
     //
@@ -286,27 +277,37 @@ unsafe fn xor_into(
     let t2 = arch::_mm256_unpacklo_epi64(b, d);
     let t3 = arch::_mm256_unpackhi_epi64(b, d);
 
-    // Split into eight 128-bit rows, ordered by block number.
+    (t0, t1, t2, t3)
+}
+
+// Combine consecutive state rows into 32 contiguous keystream bytes per block.
+// The 0x20 permutation joins the low halves (blocks 0..3), while 0x31 joins
+// the high halves (blocks 4..7).
+//
+// SAFETY: AVX2 must be available, and offset must be either 0 or 32 so that
+// each 32-byte access stays within its block and the 512-byte chunk.
+#[inline(always)]
+#[allow(clippy::cast_ptr_alignment)]
+unsafe fn xor_into(chunk: &mut [u8; 8 * 64], offset: usize, row0: StateRow, row1: StateRow) {
+    let (t0, t1, t2, t3) = transpose_row(row0);
+    let (s0, s1, s2, s3) = transpose_row(row1);
     let rows = [
-        arch::_mm256_castsi256_si128(t0),
-        arch::_mm256_castsi256_si128(t1),
-        arch::_mm256_castsi256_si128(t2),
-        arch::_mm256_castsi256_si128(t3),
-        arch::_mm256_extracti128_si256(t0, 1),
-        arch::_mm256_extracti128_si256(t1, 1),
-        arch::_mm256_extracti128_si256(t2, 1),
-        arch::_mm256_extracti128_si256(t3, 1),
+        arch::_mm256_permute2x128_si256(t0, s0, 0x20),
+        arch::_mm256_permute2x128_si256(t1, s1, 0x20),
+        arch::_mm256_permute2x128_si256(t2, s2, 0x20),
+        arch::_mm256_permute2x128_si256(t3, s3, 0x20),
+        arch::_mm256_permute2x128_si256(t0, s0, 0x31),
+        arch::_mm256_permute2x128_si256(t1, s1, 0x31),
+        arch::_mm256_permute2x128_si256(t2, s2, 0x31),
+        arch::_mm256_permute2x128_si256(t3, s3, 0x31),
     ];
 
     let base = chunk.as_mut_ptr();
     for (j, keystream) in rows.iter().enumerate() {
-        let ptr = base.add(j * 64 + offset).cast::<arch::__m128i>();
-        // Load 16 bytes of plaintext
-        let plaintext = arch::_mm_loadu_si128(ptr);
-        // Exclusive OR the keystream into the plaintext
-        let xored = arch::_mm_xor_si128(plaintext, *keystream);
-        // Write the XOR back to the buffer
-        arch::_mm_storeu_si128(ptr, xored);
+        let ptr = base.add(j * 64 + offset).cast::<arch::__m256i>();
+        let plaintext = arch::_mm256_loadu_si256(ptr);
+        let xored = arch::_mm256_xor_si256(plaintext, *keystream);
+        arch::_mm256_storeu_si256(ptr, xored);
     }
 }
 
